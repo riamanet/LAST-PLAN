@@ -1,0 +1,106 @@
+name: Verify LAST PLAN Firestore Rules
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'LAST_PLAN_Android_Project.zip'
+      - '.github/workflows/verify-firestore.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  firestore-permissions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Unzip LAST PLAN Android project
+        run: |
+          mkdir -p build-src
+          unzip -q LAST_PLAN_Android_Project.zip -d build-src
+      - name: Install Firebase emulator tooling
+        working-directory: build-src/LAST_PLAN_Android
+        run: |
+          npm install --no-save --no-package-lock firebase@11 @firebase/rules-unit-testing@4 firebase-tools@14
+      - name: Create permission scenarios
+        working-directory: build-src/LAST_PLAN_Android
+        run: |
+          mkdir -p tests
+          cat > tests/firestore-emulator.test.cjs <<'LASTPLAN_RULES_TEST'
+          'use strict';
+          const fs = require('node:fs');
+          const assert = require('node:assert/strict');
+          const { initializeTestEnvironment, assertFails, assertSucceeds } = require('@firebase/rules-unit-testing');
+          const { doc, collection, getDoc, getDocs, setDoc, updateDoc, writeBatch } = require('firebase/firestore');
+
+          (async () => {
+            const env = await initializeTestEnvironment({
+              projectId: 'demo-last-plan-rules',
+              firestore: { rules: fs.readFileSync('firebase/firestore.rules', 'utf8') },
+            });
+            try {
+              const p = 'guilds/guildA';
+              const hash = 'a'.repeat(64);
+              const owner = env.authenticatedContext('leader-1').firestore();
+              const admin = env.authenticatedContext('admin-1').firestore();
+              const member = env.authenticatedContext('member-1').firestore();
+              const stranger = env.authenticatedContext('stranger-1').firestore();
+              const guest = env.unauthenticatedContext().firestore();
+              await env.withSecurityRulesDisabled(async context => {
+                const db = context.firestore();
+                await setDoc(doc(db, p), {name:'TKOR', ownerUid:'leader-1', joinCodeHash:hash, createdAt:'2026-10-09'});
+                for (const [uid,role] of [['leader-1','leader'],['admin-1','admin'],['member-1','member']]) {
+                  await setDoc(doc(db, `${p}/members/${uid}`), {uid, role, nickname:uid, joinCodeHash:hash, joinedAt:'2026-10-09'});
+                }
+                await setDoc(doc(db, `${p}/notices/n1`), {id:'n1',content:'공지',pinned:false,createdAt:'2026-10-09',updatedAt:'2026-10-09'});
+                await setDoc(doc(db, `${p}/suggestions/s1`), {content:'건의',senderUid:'member-1',createdAt:'2026-10-09',status:'pending'});
+              });
+              await assertSucceeds(getDoc(doc(member, `${p}/notices/n1`)));
+              await assertFails(getDoc(doc(stranger, `${p}/notices/n1`)));
+              await assertFails(getDoc(doc(guest, `${p}/notices/n1`)));
+              const nextNotice = {id:'n2',content:'관리자 공지',pinned:false,createdAt:'2026-10-09',updatedAt:'2026-10-09'};
+              await assertSucceeds(setDoc(doc(admin, `${p}/notices/n2`), nextNotice));
+              await assertFails(setDoc(doc(member, `${p}/notices/n3`), {...nextNotice,id:'n3'}));
+              await assertFails(updateDoc(doc(member, `${p}/members/member-1`), {role:'leader'}));
+              await assertFails(updateDoc(doc(admin, `${p}/members/member-1`), {role:'admin'}));
+              await assertSucceeds(updateDoc(doc(owner, `${p}/members/member-1`), {role:'admin'}));
+              await assertSucceeds(updateDoc(doc(owner, `${p}/members/member-1`), {role:'member'}));
+              await assertFails(getDocs(collection(member, `${p}/suggestions`)));
+              await assertSucceeds(getDocs(collection(admin, `${p}/suggestions`)));
+              await assertSucceeds(getDoc(doc(member, `${p}/suggestions/s1`)));
+              await assertFails(getDoc(doc(stranger, `${p}/suggestions/s1`)));
+              await assertSucceeds(setDoc(doc(member, `${p}/suggestions/s2`), {content:'새 건의',senderUid:'member-1',createdAt:'2026-10-09',status:'pending'}));
+              await assertSucceeds(setDoc(doc(admin, `${p}/suggestionRestrictions/member-1`), {blocked:true,reason:'도배',actorUid:'admin-1',updatedAt:'2026-10-09'}));
+              await assertFails(setDoc(doc(member, `${p}/suggestions/s3`), {content:'차단 후 건의',senderUid:'member-1',createdAt:'2026-10-09',status:'pending'}));
+              await assertFails(setDoc(doc(admin, `${p}/suggestionRestrictions/leader-1`), {blocked:true,reason:'x',actorUid:'admin-1',updatedAt:'2026-10-09'}));
+              await assertSucceeds(setDoc(doc(member, 'bugReports/bug1'), {content:'버그',senderUid:'member-1',createdAt:'2026-10-09',status:'pending',screen:'설정'}));
+              await assertFails(getDoc(doc(stranger, 'bugReports/bug1')));
+              await assertSucceeds(getDoc(doc(member, 'bugReports/bug1')));
+              await assertFails(setDoc(doc(guest, 'bugReports/bug2'), {content:'버그',senderUid:'guest',createdAt:'2026-10-09',status:'pending',screen:'설정'}));
+              // Verify the atomic guild bootstrap supported by LastPlanBridge.java.
+              const creator = env.authenticatedContext('new-leader').firestore();
+              const newHash = 'c'.repeat(64);
+              const batch = writeBatch(creator);
+              batch.set(doc(creator,'guilds/guildB'), {name:'새 길드',ownerUid:'new-leader',joinCodeHash:newHash,createdAt:'2026-10-09'});
+              batch.set(doc(creator,`guildDirectory/${newHash}`), {guildId:'guildB',ownerUid:'new-leader',createdAt:'2026-10-09'});
+              batch.set(doc(creator,'guilds/guildB/members/new-leader'), {uid:'new-leader',nickname:'길드장',role:'leader',joinCodeHash:newHash,joinedAt:'2026-10-09'});
+              await assertSucceeds(batch.commit());
+              await assertFails(setDoc(doc(stranger,`${p}/members/stranger-1`), {uid:'stranger-1',nickname:'침입',role:'leader',joinCodeHash:hash,joinedAt:'2026-10-09'}));
+              console.log('PASS: Firestore emulator permissions: member/admin/leader/guest, suggestions, restrictions, bug reports, atomic guild creation.');
+            } finally { await env.cleanup(); }
+          })().catch(err => { console.error(err); process.exitCode = 1; });
+          LASTPLAN_RULES_TEST
+      - name: Test real Firestore Security Rules in a local emulator
+        working-directory: build-src/LAST_PLAN_Android
+        run: |
+          npx firebase emulators:exec --only firestore --project demo-last-plan-rules \
+            'node tests/firestore-emulator.test.cjs'
