@@ -1,0 +1,48 @@
+name: LAST PLAN Free FCM Sender (Optional)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Check eligible notifications without sending any push'
+        required: true
+        type: boolean
+        default: true
+  schedule:
+    # GitHub scheduled Actions can be delayed or skipped. No precise alerts.
+    # Offset from :00 to avoid peak load. Runs at :02, :07, ..., :57 UTC.
+    - cron: '2-59/5 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lastplan-fcm-sender
+  cancel-in-progress: false
+
+jobs:
+  send-fcm:
+    if: ${{ vars.LASTPLAN_PUSH_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Extract LAST PLAN project
+        run: |
+          mkdir -p build-src
+          unzip -q LAST_PLAN_Android_Project.zip -d build-src
+      - name: Install Firebase Admin sender dependencies
+        working-directory: build-src/LAST_PLAN_Android/github-push
+        run: npm install --no-audit --no-fund --no-package-lock
+      - name: Verify no-send unit tests
+        working-directory: build-src/LAST_PLAN_Android/github-push
+        run: npm test
+      - name: Send eligible FCM notifications
+        working-directory: build-src/LAST_PLAN_Android
+        env:
+          LASTPLAN_FIREBASE_SERVICE_ACCOUNT: ${{ secrets.LASTPLAN_FIREBASE_SERVICE_ACCOUNT }}
+          LASTPLAN_PUSH_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+        run: node github-push/send.cjs
