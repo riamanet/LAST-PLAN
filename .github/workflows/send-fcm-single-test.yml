@@ -1,0 +1,75 @@
+name: LAST PLAN One-Time Push Test
+
+# Sends only one manual test notification. No cron and no automatic triggers.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lastplan-fcm-one-time-test
+  cancel-in-progress: false
+
+jobs:
+  test-single-device:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Unpack Android project
+        run: |
+          mkdir -p build-src
+          unzip -q LAST_PLAN_Android_Project.zip -d build-src
+      - name: Install existing Firebase Admin dependency
+        working-directory: build-src/LAST_PLAN_Android/github-push
+        run: npm install --no-audit --no-fund --no-package-lock
+      - name: Send one safe FCM test to the only registered opted-in device
+        working-directory: build-src/LAST_PLAN_Android/github-push
+        env:
+          LASTPLAN_FIREBASE_SERVICE_ACCOUNT: ${{ secrets.LASTPLAN_FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          node <<'NODE'
+          'use strict';
+          const {initializeApp, cert} = require('firebase-admin/app');
+          const {getFirestore} = require('firebase-admin/firestore');
+          const {getMessaging} = require('firebase-admin/messaging');
+          (async () => {
+            const raw = process.env.LASTPLAN_FIREBASE_SERVICE_ACCOUNT;
+            if (!raw) throw new Error('Missing LASTPLAN_FIREBASE_SERVICE_ACCOUNT GitHub secret');
+            const credentials = JSON.parse(raw);
+            if (credentials.project_id !== 'last-plan' || !credentials.client_email || !credentials.private_key) {
+              throw new Error('Firebase service account is not for LAST PLAN');
+            }
+            initializeApp({credential: cert(credentials), projectId: 'last-plan'});
+            const db = getFirestore();
+            // Hard stop if zero or multiple registered devices exist, including disabled devices.
+            const registry = await db.collection('notificationDevices').limit(2).get();
+            if (registry.size !== 1) throw new Error(`Expected exactly 1 registered device, found ${registry.size === 2 ? '2 or more' : '0'}. No push was sent.`);
+            const snap = registry.docs[0];
+            const d = snap.data();
+            if (d.uid !== snap.id || d.shield !== true || typeof d.token !== 'string' || d.token.length < 20 ||
+                typeof d.guildId !== 'string' || !/^[A-Za-z0-9_-]{1,120}$/.test(d.guildId) ||
+                ![5,10,15,20,25,30].includes(d.shieldMinutes)) {
+              throw new Error('Registered device has no valid, opted-in shield notification settings. No push was sent.');
+            }
+            const member = await db.doc(`guilds/${d.guildId}/members/${d.uid}`).get();
+            if (!member.exists) throw new Error('Device owner is not currently a member of the guild. No push was sent.');
+            // Existing LastPlanMessagingService displays FCM data messages only for opted-in types.
+            await getMessaging().send({
+              token: d.token,
+              data: {
+                kind: 'shield',
+                guildId: d.guildId,
+                minutes: String(d.shieldMinutes),
+                body: 'LAST PLAN 푸시 수신 테스트입니다. 실제 보호막 종료 안내가 아닙니다.'
+              },
+              android: {priority: 'high', ttl: 600000}
+            });
+            console.log('SUCCESS: One manual FCM test was accepted for the only registered opted-in device.');
+            console.log('NOTE: FCM acceptance does not prove Android notification display; check the phone.');
+          })().catch(err => { console.error('Test stopped:', err.code || err.message); process.exitCode = 1; });
+          NODE
