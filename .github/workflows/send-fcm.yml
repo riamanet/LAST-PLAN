@@ -22,7 +22,8 @@ concurrency:
 
 jobs:
   send-fcm:
-    if: ${{ vars.LASTPLAN_PUSH_ENABLED == 'true' }}
+    # Allow safe manual preview while keeping scheduled/live delivery OFF by default.
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run == true) || (github.event_name == 'schedule' && vars.LASTPLAN_PUSH_ENABLED == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
