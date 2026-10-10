@@ -1,0 +1,38 @@
+name: Verify LAST PLAN FCM Registration Rules
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'LAST_PLAN_Android_Project.zip'
+      - '.github/workflows/verify-fcm-rules.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-fcm-registration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Unpack LAST PLAN project
+        run: |
+          mkdir -p build-src
+          unzip -q LAST_PLAN_Android_Project.zip -d build-src
+      - name: Install Firestore emulator and test libraries
+        working-directory: build-src/LAST_PLAN_Android
+        run: npm install --no-save --no-package-lock firebase@11 @firebase/rules-unit-testing@4 firebase-tools@14
+      - name: Test FCM device-registration permission rules (emulator only)
+        working-directory: build-src/LAST_PLAN_Android
+        run: |
+          npx firebase emulators:exec --only firestore --project demo-last-plan-devices \
+            'node tests/firestore-notification-devices.test.cjs'
