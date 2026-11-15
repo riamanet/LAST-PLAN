@@ -55,13 +55,22 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          index = Path('build-src/LAST_PLAN_Android/app/src/main/assets/index.html')
+          index = Path(
+              'build-src/LAST_PLAN_Android/app/src/main/assets/index.html'
+          )
           source = index.read_text(encoding='utf-8')
 
-          anchor = '/* Use a single final baseline offset for both placeholder and typed values.'
+          anchor = (
+              '/* Use a single final baseline offset '
+              'for both placeholder and typed values.'
+          )
+
           start = source.find(anchor)
+
           if start == -1:
-              raise RuntimeError('Expected login input alignment styles were not found')
+              raise RuntimeError(
+                  'Expected login input alignment styles were not found'
+              )
 
           end = source.find('</style>', start)
           block = source[start:end]
@@ -70,11 +79,42 @@ jobs:
           after = 'transform:translateY(2px)!important;'
 
           if block.count(before) != 1:
-              raise RuntimeError('Expected login baseline rule was not found exactly once')
+              raise RuntimeError(
+                  'Expected login baseline rule was not found exactly once'
+              )
 
-          source = source[:start] + block.replace(before, after, 1) + source[end:]
+          source = (
+              source[:start]
+              + block.replace(before, after, 1)
+              + source[end:]
+          )
+
+          # Keep guild name at +2px.
+          # Lower only guild code to +4px.
+          if source.count('id="loginGuildCode"') != 1:
+              raise RuntimeError(
+                  'Expected login guild code field was not found exactly once'
+              )
+
+          rule = (
+              '\n#loginScreen #loginGuildCode'
+              '{transform:translateY(4px)!important;}\n'
+          )
+
+          style_end = source.find('</style>', start)
+
+          source = (
+              source[:style_end]
+              + rule
+              + source[style_end:]
+          )
+
           index.write_text(source, encoding='utf-8')
-          print('Aligned guild name and code input text vertically.')
+
+          print(
+              'Guild name: +2px; '
+              'guild code: +4px (additional 2px lower).'
+          )
           PY
 
       - name: Restore signing key
@@ -93,7 +133,9 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
           test -n "$KEYSTORE_PASSWORD" || (echo "Missing ANDROID_KEYSTORE_PASSWORD secret" && exit 1)
+
           mkdir -p dist
+
           UNSIGNED="build-src/LAST_PLAN_Android/app/build/outputs/apk/release/app-release-unsigned.apk"
           ALIGNED="$RUNNER_TEMP/LAST-PLAN-aligned.apk"
           ZIPALIGN="$ANDROID_SDK_ROOT/build-tools/35.0.0/zipalign"
