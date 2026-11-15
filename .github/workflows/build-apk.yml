@@ -1,4 +1,3 @@
-
 name: Build LAST PLAN APK
 
 on:
@@ -110,6 +109,100 @@ jobs:
           source = source.replace(old, new, 1)
           bridge.write_text(source, encoding='utf-8')
           print('Guild names will be included in new bug reports.')
+          PY
+
+      - name: Add gift coupon panel inside LAST PLAN
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64, gzip, hashlib
+
+          assets = Path('build-src/LAST_PLAN_Android/app/src/main/assets')
+          index = assets / 'index.html'
+          html = index.read_text(encoding='utf-8')
+          tag = '<script src="lastplan-coupon.js"></script>'
+          if tag not in html:
+              if html.count('</body>') != 1:
+                  raise RuntimeError('HTML body closing tag not found exactly once')
+              html = html.replace('</body>', tag + '\n</body>', 1)
+              index.write_text(html, encoding='utf-8')
+
+          payload = (
+          'H4sIAAAAAAAC/608/XPbxpW/96/YyG0IpiQEgN+kpJwiK7Fjx3Yt5dyLRuOCwJJEBAI8ANRHFM347jydTJOZuHPxJe04PXfapE0vM+dp3Gs6Tedm+qfkR5P+'
+          'H+693QWwAEmJvbvYlsDdt/vevu/3sMzqS+T65s4uuXV980abOF7ZHI1I3+lFZcu3KRmZHnWJcqgXVXLDJ67fdzyySvpjx7WJbUYmGY4jM3J8TyUvrX5HUYpk'
+          'fYOcfoeQwjikJIwCx4oKHfjs9Ihy5Hi2f6TeveuaYXTLNb0tfzzyvVuI5DY17ZMiCWg0DjxccCEwWSdRMKad7wCw5XthRF578+rl7btbNy9v78BkYRBFo7C9'
+          'uhqYR2rfiQbjLtAUAGhEvUi1/OFq4JhD2C9aRRxlMzxxx8MyHM6mq0PT8VaRB6H6duh77Awylu0bl2/dvHpjV0YUWoEzitS+7/ddyhAMTSvww9VwdfNa78Tq'
+          'nuiXr26/9YPXG9Vu7drmW5thq0YPTw4PB1eutmrR8c2TUfmt7bf115ztrc3tN81aTT/ohdpW9e9v3e3pw7uj60e1/io9ppZEzps725fvXtv+ByQEjzECVt2F'
+          'g9p3Lcaw8O6hLoFvbW5d2Z6B56B3LZAoyDi7Ymd3c/fqFoCjWHEQeNIme4Xrm9eu3rhs1AsleKzUtGv1rRvs+bXbmzfEsFHf2nx1W2fP+BRDa3carxpvcJDa'
+          'neaWeNTuvPJWiz3qtTu3blQv8+ebd1qvNn7Ini9vbf9QN4wK+3Dttl671tqMn41rjZvxM1BznT3funbzdqPR4M+vb96Knzd3+NOd67swAQ91/cqd6nXcLDpy'
+          'zVG9Xo8fm81mYb/EDt91feuA2vz4V+LD37y2K5706vYrtzkXfnD1h1dhVCwcj8BacGHB0Ix6WdfLeqUAM2cpn60wBCb/iIFfYhZ2xR/SHSug1COqOyozsxyA'
+          '6p+O/NBBo2sH1AXrO6SdswuWgSH2+zTgIiQk2cDshr47jmgH5gdRu6yPjjuRP2pX4fc7ZTBBetzWmx2xzHZCUJeTds+lx523x2Hk9E7KwqDaFvygQcd0nb5X'
+          'diI6DOMhsfrIsaNBu1qBrQeUoWPPI9O2Ha/f1jpdP7BpUA5M2xmH7SbMiZV8og3EESDXsUnQ75qK3qqWDK1RMgyjpNaMYgJtWgf9wB97dtt1PGoG5T5uCbQo'
+          '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'
+          'AzAA2QF7RAAA'
+          )
+          script = gzip.decompress(base64.b64decode(payload))
+          expected_sha256 = 'e1a99c9b462932ad26e84088d63502a82f203261229b3b13a1238b8024f3f3e6'
+          if hashlib.sha256(script).hexdigest() != expected_sha256:
+              raise RuntimeError('Coupon script integrity check failed')
+          (assets / 'lastplan-coupon.js').write_bytes(script)
+          print('In-app gift icon, unread badge and coupon panel installed')
           PY
 
       - name: Restore signing key
