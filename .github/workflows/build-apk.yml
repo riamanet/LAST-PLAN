@@ -1,3 +1,4 @@
+
 name: Build LAST PLAN APK
 
 on:
@@ -48,6 +49,33 @@ jobs:
           rm -rf build-src
           mkdir -p build-src
           unzip -q LAST_PLAN_Android_Project.zip -d build-src
+
+      - name: Center guild login field text
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          index = Path('build-src/LAST_PLAN_Android/app/src/main/assets/index.html')
+          source = index.read_text(encoding='utf-8')
+
+          anchor = '/* Use a single final baseline offset for both placeholder and typed values.'
+          start = source.find(anchor)
+          if start == -1:
+              raise RuntimeError('Expected login input alignment styles were not found')
+
+          end = source.find('</style>', start)
+          block = source[start:end]
+
+          before = 'transform:translateY(-2px)!important;'
+          after = 'transform:translateY(2px)!important;'
+
+          if block.count(before) != 1:
+              raise RuntimeError('Expected login baseline rule was not found exactly once')
+
+          source = source[:start] + block.replace(before, after, 1) + source[end:]
+          index.write_text(source, encoding='utf-8')
+          print('Aligned guild name and code input text vertically.')
+          PY
 
       - name: Restore signing key
         env:
