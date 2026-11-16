@@ -380,8 +380,10 @@ jobs:
           rows.set(a('layout_height'), '0dp')
           rows.set(a('layout_weight'), '1')
           rows.set(a('orientation'), 'vertical')
-          rows.set(a('paddingTop'), '2dp')
-          rows.set(a('paddingBottom'), '0dp')
+          # Give the tabs and first row a clear gap, and keep the final
+          # row separated from the app button. Preserve the six flexible rows.
+          rows.set(a('paddingTop'), '12dp')
+          rows.set(a('paddingBottom'), '10dp')
 
           # Keep header and actions fixed, leaving all extra (or reduced)
           # space to be divided evenly among the visible rows.
