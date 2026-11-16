@@ -233,6 +233,63 @@ jobs:
           print('Lowered five-button member menu; removed oversized bottom safe-area padding')
           PY
 
+      - name: Keep Survival Battle anchored while allowing inner list scroll
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+
+          index = Path('build-src/LAST_PLAN_Android/app/src/main/assets/index.html')
+          html = index.read_text(encoding='utf-8')
+          marker = 'lastplan-stable-survival-layout-v1'
+          if marker not in html:
+              # The member screen is normally a scroll container; Survival Battle
+              # does not need to move the guild header and billboard with the list.
+              css = '''<style id="lastplan-stable-survival-layout-v1">
+              #memberMode.lastplan-survival-fixed {
+                overflow-y: hidden !important;
+                overscroll-behavior-y: none;
+              }
+              #memberMode.lastplan-survival-fixed > .member-shell {
+                height: 100% !important;
+                min-height: 0 !important;
+                display: flex !important;
+                flex-direction: column !important;
+                padding-bottom: calc(96px + env(safe-area-inset-bottom)) !important;
+              }
+              #memberMode.lastplan-survival-fixed .member-top,
+              #memberMode.lastplan-survival-fixed .billboard-strip {
+                flex-shrink: 0 !important;
+              }
+              #memberMode.lastplan-survival-fixed .member-content {
+                flex: 0 1 auto !important;
+                min-height: 0 !important;
+                overflow-x: hidden !important;
+                overflow-y: auto !important;
+                overscroll-behavior-y: contain;
+                -webkit-overflow-scrolling: touch;
+              }
+              </style>'''
+              if html.count('</head>') != 1:
+                  raise RuntimeError('Expected exactly one HTML head')
+              html = html.replace('</head>', css + '\n</head>', 1)
+
+              start = html.find('function activateMemberTab(tab){')
+              if start < 0:
+                  raise RuntimeError('Member tab handler missing')
+              end = html.find('function saveMemberTabOrder()', start)
+              if end < 0:
+                  raise RuntimeError('Member tab handler end missing')
+              fragment = html[start:end]
+              old = "    const isSurvival = key === 'survival';"
+              if fragment.count(old) != 1:
+                  raise RuntimeError('Expected one Survival tab flag')
+              new = old + "\n    memberMode.classList.toggle('lastplan-survival-fixed', isSurvival);\n    if (isSurvival) memberMode.scrollTop = 0;"
+              fragment = fragment.replace(old, new, 1)
+              html = html[:start] + fragment + html[end:]
+              index.write_text(html, encoding='utf-8')
+          print('Survival Battle main screen anchored; inner scroll retained on small screens')
+          PYCODE
+
       - name: Restore signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
