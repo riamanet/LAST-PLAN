@@ -341,96 +341,126 @@ jobs:
           print('Survival Battle: header and 6 full rows fixed, no inner or outer scroll')
           PYCODE
 
-      - name: Fit full Survival widget into fewer home-screen rows
+      - name: Adapt widget row spacing to actual home-screen widget height
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import xml.etree.ElementTree as ET
-          
+
           base = Path('build-src/LAST_PLAN_Android/app/src/main/res')
           A = '{http://schemas.android.com/apk/res/android}'
           ET.register_namespace('android', 'http://schemas.android.com/apk/res/android')
-          
-          names = (
-              'widget_row_survival',
-              'widget_row_survival_gold_highlight',
-              'widget_row_survival_ivory_highlight',
-              'widget_row_survival_navy_highlight',
-              'widget_row_survival_silver_highlight',
-          )
-          
-          # Both highlighted and plain Survival rows are native RemoteViews.
-          # Compact their vertical dimension consistently without changing colors/text.
-          for name in names:
-              path = base / 'layout' / (name + '.xml')
-              if not path.is_file():
-                  raise RuntimeError(f'Missing native widget layout: {path}')
-              tree = ET.parse(path)
-              root = tree.getroot()
-              groups = [child for child in root if child.tag.endswith('LinearLayout')]
-              if len(groups) != 1 or A+'minHeight' not in groups[0].attrib:
-                  raise RuntimeError(f'Unexpected Survival row structure: {name}')
-              body = groups[0]
-              body.set(A+'minHeight', '34dp')
-              body.set(A+'paddingTop', '2dp')
-              body.set(A+'paddingBottom', '2dp')
-              labels = 0
-              for child in body:
-                  label_id = child.get(A+'id', '')
-                  if label_id.endswith('/widget_row_time') or label_id.endswith('/widget_row_title'):
-                      child.set(A+'minHeight', '27dp')
-                      labels += 1
-              if labels != 2:
-                  raise RuntimeError(f'Cannot find both widget row labels in {name}')
-              tree.write(path, encoding='utf-8', xml_declaration=True)
-          
-          # Reduce only decorative gaps surrounding the widget content.
+          def a(name): return A + name
+          def is_id(element, suffix):
+              return (element.get(a('id'), '')).endswith('/' + suffix)
+
+          # The previous fixed-height widget rows caused six entries to be
+          # clipped when Samsung Home resized the widget. Use measured parent
+          # height and Android LinearLayout weights instead of a fixed 34dp.
           main = base / 'layout' / 'widget_last_plan.xml'
           if not main.is_file():
-              raise RuntimeError(f'Missing native widget layout: {main}')
+              raise RuntimeError('Widget host layout missing')
           tree = ET.parse(main)
-          root = tree.getroot()
-          outer = [child for child in root if child.tag.endswith('LinearLayout')]
-          if len(outer) != 1:
-              raise RuntimeError('Unexpected widget outer container')
-          card = outer[0]
-          card.set(A+'paddingTop', '6dp')
-          card.set(A+'paddingBottom', '6dp')
-          seen = set()
-          for element in card.iter():
-              identifier = element.get(A+'id', '')
-              if identifier.endswith('/widget_header'):
-                  element.set(A+'layout_height', '24dp')
-                  seen.add('title')
-              elif identifier.endswith('/widget_rows'):
-                  element.set(A+'paddingTop', '2dp')
-                  seen.add('rows')
-              elif identifier.endswith('/widget_tab_survival'):
-                  # Parent contains the three tabs, retain their original sizes.
-                  seen.add('tabs')
-              elif identifier.endswith('/widget_open_app'):
-                  seen.add('footer')
-          if seen != {'title', 'rows', 'tabs', 'footer'}:
-              raise RuntimeError(f'Unexpected widget content structure: {seen}')
-          for element in list(card):
-              ids = [x.get(A+'id','') for x in element.iter()]
-              if any(i.endswith('/widget_tab_survival') for i in ids):
-                  element.set(A+'layout_marginTop', '6dp')
-                  element.set(A+'layout_height', '32dp')
-              if any(i.endswith('/widget_open_app') for i in ids):
-                  element.set(A+'layout_marginTop', '2dp')
-                  element.set(A+'layout_height', '30dp')
+          frame = tree.getroot()
+          if not frame.tag.endswith('FrameLayout'):
+              raise RuntimeError('Unexpected widget root; no changes written')
+          cards = [x for x in frame if x.tag.endswith('LinearLayout')]
+          if len(cards) != 1:
+              raise RuntimeError('Expected one vertical widget card container')
+          card = cards[0]
+          card.set(a('layout_height'), 'match_parent')
+          card.set(a('orientation'), 'vertical')
+          card.set(a('paddingTop'), '6dp')
+          card.set(a('paddingBottom'), '6dp')
+
+          widget_rows = [x for x in card.iter() if is_id(x, 'widget_rows')]
+          if len(widget_rows) != 1 or widget_rows[0] not in list(card):
+              raise RuntimeError('Widget rows must be a direct child of the card')
+          rows = widget_rows[0]
+          rows.set(a('layout_height'), '0dp')
+          rows.set(a('layout_weight'), '1')
+          rows.set(a('orientation'), 'vertical')
+          rows.set(a('paddingTop'), '2dp')
+          rows.set(a('paddingBottom'), '0dp')
+
+          # Keep header and actions fixed, leaving all extra (or reduced)
+          # space to be divided evenly among the visible rows.
+          header = [x for x in card.iter() if is_id(x, 'widget_header')]
+          if len(header) != 1:
+              raise RuntimeError('Missing widget header')
+          header[0].set(a('layout_height'), '24dp')
+          tab_containers = [x for x in card if any(is_id(c, 'widget_tab_survival') for c in x.iter())]
+          footer_containers = [x for x in card if any(is_id(c, 'widget_open_app') for c in x.iter())]
+          if len(tab_containers) != 1 or len(footer_containers) != 1:
+              raise RuntimeError('Missing widget tabs or footer')
+          tabs, footer = tab_containers[0], footer_containers[0]
+          if rows in (tabs, footer):
+              raise RuntimeError('Widget structural mismatch')
+          tabs.set(a('layout_height'), '32dp')
+          tabs.set(a('layout_marginTop'), '6dp')
+          footer.set(a('layout_height'), '30dp')
+          footer.set(a('layout_marginTop'), '2dp')
           tree.write(main, encoding='utf-8', xml_declaration=True)
-          
-          # Recommend a four-cell-high initial widget instead of two cramped cells.
-          # Existing widgets are resizable and can be shrunk after app update.
+
+          # A RemoteViews child inherits its root layout parameters when
+          # added to widget_rows. Each row must have height=0dp + weight=1.
+          # Its inner colored bar/text also fills the row so text stays
+          # vertically centered and highlight backgrounds follow the size.
+          changed = []
+          for path in sorted((base / 'layout').glob('widget_row_*.xml')):
+              tree = ET.parse(path)
+              root = tree.getroot()
+              if not root.tag.endswith('LinearLayout'):
+                  continue
+              if len(root) < 2:
+                  continue
+              bodies = [child for child in root if child.tag.endswith('LinearLayout')]
+              if len(bodies) != 1:
+                  continue
+              body = bodies[0]
+              labels = [child for child in body if is_id(child, 'widget_row_time') or is_id(child, 'widget_row_title')]
+              if len(labels) != 2:
+                  continue
+              if not any(is_id(c, 'widget_row_divider') for c in root):
+                  # Some variants have an unlabelled divider. Any 1dp TextView
+                  # immediately following the body is an acceptable divider.
+                  other = [c for c in root if c is not body]
+                  if len(other) != 1 or not other[0].tag.endswith('TextView'):
+                      continue
+              root.set(a('layout_height'), '0dp')
+              root.set(a('layout_weight'), '1')
+              root.set(a('orientation'), 'vertical')
+              root.set(a('minHeight'), '0dp')
+              body.set(a('layout_height'), '0dp')
+              body.set(a('layout_weight'), '1')
+              body.set(a('minHeight'), '0dp')
+              body.set(a('paddingTop'), '1dp')
+              body.set(a('paddingBottom'), '1dp')
+              for label in labels:
+                  label.set(a('layout_height'), 'match_parent')
+                  label.set(a('minHeight'), '0dp')
+                  # Keep the original textSize/color/maxLines; only center it.
+                  label.set(a('gravity'), 'center_vertical')
+              tree.write(path, encoding='utf-8', xml_declaration=True)
+              changed.append(path.name)
+
+          if not {'widget_row_survival.xml', 'widget_row_survival_silver_highlight.xml'}.issubset(set(changed)):
+              raise RuntimeError('Missing normal/silver Survival row layouts')
+          if len(changed) < 6:
+              raise RuntimeError(f'Not enough widget row variants updated: {changed}')
+
+          # The six rows need a readable minimum size. The visual layout
+          # expands/contracts above that limit, without shrinking font sizes.
           info = base / 'xml' / 'last_plan_widget_info.xml'
-          if info.exists():
-              tree = ET.parse(info)
-              tree.getroot().set(A+'targetCellHeight', '4')
-              tree.write(info, encoding='utf-8', xml_declaration=True)
-          
-          print('Compact widget: six 34dp Survival rows, unchanged fonts/highlights, 4-cell initial height')
+          if info.is_file():
+              info_tree = ET.parse(info)
+              root = info_tree.getroot()
+              root.set(a('minResizeHeight'), '245dp')
+              root.set(a('targetCellHeight'), '4')
+              info_tree.write(info, encoding='utf-8', xml_declaration=True)
+
+          print('Adaptive widget: card fills host height, visible rows share available space')
+          print('Updated row variants: ' + ', '.join(changed))
           PY
 
       - name: Restore signing key
