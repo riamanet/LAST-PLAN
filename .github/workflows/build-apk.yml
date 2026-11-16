@@ -463,6 +463,50 @@ jobs:
           print('Updated row variants: ' + ', '.join(changed))
           PY
 
+      - name: Always render all six guild/Survival widget rows
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          # The Android renderer estimates how many lines fit and truncates its
+          # data to that count BEFORE applying the flexible 1/N row heights.
+          # On Samsung One UI this estimate can be four at a widget size that
+          # easily accommodates six. Keep at least six actual rows in the list.
+          root = Path('build-src/LAST_PLAN_Android/app/src/main')
+          candidates = list((root / 'java').rglob('LastPlanWidgetProvider.java'))
+          if len(candidates) != 1:
+              raise RuntimeError(f'Expected one widget provider Java file, found {len(candidates)}')
+          path = candidates[0]
+          src = path.read_text(encoding='utf-8')
+
+          marker = 'LASTPLAN_ALWAYS_RENDER_SIX_WIDGET_ROWS'
+          if marker in src:
+              print('Six-row widget render fix already included')
+          else:
+              # The source may order the two arguments either way. Target the
+              # unique Math.min involving a row-list .size() and the height cap.
+              # The APK's dex confirms the layout renderer makes this call.
+              patterns = [
+                  re.compile(r'Math\s*\.\s*min\s*\(\s*((?:[A-Za-z_$][\w$]*\.)?[A-Za-z_$][\w$]*\.size\(\))\s*,\s*([A-Za-z_$][\w$]*)\s*\)'),
+                  re.compile(r'Math\s*\.\s*min\s*\(\s*([A-Za-z_$][\w$]*)\s*,\s*((?:[A-Za-z_$][\w$]*\.)?[A-Za-z_$][\w$]*\.size\(\))\s*\)'),
+              ]
+              matches = []
+              for order, regex in enumerate(patterns):
+                  for match in regex.finditer(src):
+                      row_size, cap = (match.group(1), match.group(2)) if order == 0 else (match.group(2), match.group(1))
+                      matches.append((match.start(), match.end(), row_size, cap, match.group()))
+              # Do not change a random list in case the source evolves.
+              if len(matches) != 1:
+                  raise RuntimeError('Cannot safely identify unique row-count cap: ' + repr(matches[:8]))
+              start, end, row_size, cap, original = matches[0]
+              replacement = f'Math.min({row_size}, Math.max(6, {cap})) /* {marker} */'
+              src = src[:start] + replacement + src[end:]
+              path.write_text(src, encoding='utf-8')
+              print('Widget visible row cap:', original, '=>', replacement)
+              assert src.count(marker) == 1
+          PY
+
       - name: Restore signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
