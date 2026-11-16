@@ -233,40 +233,91 @@ jobs:
           print('Lowered five-button member menu; removed oversized bottom safe-area padding')
           PY
 
-      - name: Keep Survival Battle anchored while allowing inner list scroll
+      - name: Fit all six Survival Battle slots without any scrolling
         run: |
           python3 - <<'PYCODE'
           from pathlib import Path
 
           index = Path('build-src/LAST_PLAN_Android/app/src/main/assets/index.html')
           html = index.read_text(encoding='utf-8')
-          marker = 'lastplan-stable-survival-layout-v1'
+          marker = 'lastplan-stable-survival-layout-v2'
           if marker not in html:
-              # The member screen is normally a scroll container; Survival Battle
-              # does not need to move the guild header and billboard with the list.
-              css = '''<style id="lastplan-stable-survival-layout-v1">
+              # Fix the original issue without the inner scrollbar.  The six
+              # time slots shrink evenly inside the available screen height.
+              css = '''<style id="lastplan-stable-survival-layout-v2">
               #memberMode.lastplan-survival-fixed {
                 overflow-y: hidden !important;
-                overscroll-behavior-y: none;
+                overscroll-behavior-y: none !important;
               }
               #memberMode.lastplan-survival-fixed > .member-shell {
+                box-sizing: border-box !important;
                 height: 100% !important;
                 min-height: 0 !important;
                 display: flex !important;
                 flex-direction: column !important;
-                padding-bottom: calc(96px + env(safe-area-inset-bottom)) !important;
+                padding-bottom: calc(136px + env(safe-area-inset-bottom)) !important;
               }
               #memberMode.lastplan-survival-fixed .member-top,
               #memberMode.lastplan-survival-fixed .billboard-strip {
-                flex-shrink: 0 !important;
+                flex: 0 0 auto !important;
               }
               #memberMode.lastplan-survival-fixed .member-content {
-                flex: 0 1 auto !important;
+                flex: 1 1 auto !important;
+                display: flex !important;
+                flex-direction: column !important;
                 min-height: 0 !important;
-                overflow-x: hidden !important;
-                overflow-y: auto !important;
-                overscroll-behavior-y: contain;
-                -webkit-overflow-scrolling: touch;
+                overflow: hidden !important;
+                margin-bottom: 0 !important;
+                padding-bottom: clamp(12px, 1.8vh, 24px) !important;
+              }
+              #memberMode.lastplan-survival-fixed .member-content-head {
+                flex: 0 0 auto !important;
+              }
+              #memberMode.lastplan-survival-fixed #memberSurvivalPanel.show {
+                flex: 1 1 auto !important;
+                min-height: 0 !important;
+                display: flex !important;
+                flex-direction: column !important;
+                margin-top: clamp(12px, 1.8vh, 20px) !important;
+              }
+              #memberMode.lastplan-survival-fixed #survivalDayTabs {
+                flex: 0 0 auto !important;
+                margin-bottom: clamp(6px, 1.0vh, 12px) !important;
+              }
+              #memberMode.lastplan-survival-fixed #survivalRows {
+                flex: 1 1 auto !important;
+                min-height: 0 !important;
+                grid-template-rows: repeat(6, minmax(0, 1fr)) !important;
+                gap: clamp(4px, .8vh, 7px) !important;
+                overflow: hidden !important;
+              }
+              #memberMode.lastplan-survival-fixed #survivalRows .common-row {
+                min-height: 0 !important;
+                height: 100% !important;
+                padding-top: clamp(3px, .6vh, 8px) !important;
+                padding-bottom: clamp(3px, .6vh, 8px) !important;
+              }
+              @media (max-height: 660px) {
+                #memberMode.lastplan-survival-fixed > .member-shell {
+                  padding-top: 3.5% !important;
+                  padding-bottom: calc(104px + env(safe-area-inset-bottom)) !important;
+                }
+                #memberMode.lastplan-survival-fixed .billboard-strip {
+                  margin-top: 12px !important;
+                  padding-top: 9px !important;
+                  padding-bottom: 9px !important;
+                }
+                #memberMode.lastplan-survival-fixed .member-content {
+                  margin-top: 10px !important;
+                  padding-top: 12px !important;
+                  padding-bottom: 9px !important;
+                }
+                #memberMode.lastplan-survival-fixed #memberSurvivalPanel.show {
+                  margin-top: 8px !important;
+                }
+                #memberMode.lastplan-survival-fixed #survivalDayTabs .common-day-tab {
+                  height: 30px !important;
+                }
               }
               </style>'''
               if html.count('</head>') != 1:
@@ -287,7 +338,7 @@ jobs:
               fragment = fragment.replace(old, new, 1)
               html = html[:start] + fragment + html[end:]
               index.write_text(html, encoding='utf-8')
-          print('Survival Battle main screen anchored; inner scroll retained on small screens')
+          print('Survival Battle: header and 6 full rows fixed, no inner or outer scroll')
           PYCODE
 
       - name: Restore signing key
