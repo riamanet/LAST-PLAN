@@ -602,6 +602,240 @@ jobs:
               assert src.count(marker) == 1
           PY
 
+      - name: Share six-slot widget spacing across tabs and show font-size controls
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import xml.etree.ElementTree as ET
+          
+          base = Path('build-src/LAST_PLAN_Android/app/src/main')
+          assets = base / 'assets' / 'index.html'
+          res = base / 'res'
+          java_candidates = list((base / 'java').rglob('LastPlanWidgetProvider.java'))
+          if len(java_candidates) != 1:
+              raise RuntimeError(f'Expected one LastPlanWidgetProvider.java, got {java_candidates}')
+          java = java_candidates[0]
+          marker = 'LASTPLAN_SIX_SLOT_SCALED_ROWS_V40'
+          source = java.read_text(encoding='utf-8')
+          if marker in source:
+              raise RuntimeError('This step should run exactly once on clean source')
+          
+          # Exactly six equal height slots, regardless of active tab's item count.
+          # Real content rows are distributed as in Survival; unused slots become
+          # transparent spacer rows, so a three-item Guild-war list does not balloon.
+          android_uri = '{http://schemas.android.com/apk/res/android}'
+          ET.register_namespace('android', 'http://schemas.android.com/apk/res/android')
+          def a(k): return android_uri+k
+          changed=[]
+          for path in sorted((res / 'layout').glob('widget_row_*.xml')):
+              t=ET.parse(path)
+              root=t.getroot()
+              if not root.tag.endswith('LinearLayout'): continue
+              bodies=[node for node in root if node.tag.endswith('LinearLayout')]
+              if len(bodies)!=1: continue
+              body=bodies[0]
+              labels=[node for node in body if node.get(a('id'),'').endswith(('/widget_row_time','/widget_row_title'))]
+              if len(labels)!=2: continue
+              root.set(a('layout_height'),'0dp')
+              root.set(a('layout_weight'),'1')
+              root.set(a('minHeight'),'0dp')
+              body.set(a('layout_height'),'0dp')
+              body.set(a('layout_weight'),'1')
+              body.set(a('minHeight'),'0dp')
+              body.set(a('paddingTop'),'0dp')
+              body.set(a('paddingBottom'),'0dp')
+              # Preserve original font sizes: the prior changes made text LOOK smaller
+              # by reducing every row's vertical space, not by changing the sp values.
+              for label in labels:
+                  label.set(a('layout_height'),'match_parent')
+                  label.set(a('minHeight'),'0dp')
+                  label.set(a('gravity'),'center_vertical')
+              t.write(path,encoding='utf-8',xml_declaration=True)
+              changed.append(path.name)
+          need = {'widget_row_survival.xml','widget_row_survival_silver_highlight.xml'}
+          if not need.issubset(set(changed)) or len(changed)<6:
+              raise RuntimeError(f'Missing widget row variants: {changed}')
+          
+          spacer=res/'layout'/'widget_row_balancer.xml'
+          spacer.write_text('''<?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="0dp"
+              android:layout_weight="1"
+              android:minHeight="0dp"
+              android:orientation="vertical"
+              android:background="@android:color/transparent" />
+          ''',encoding='utf-8')
+          
+          # The Java provider assembles Android RemoteViews for the widget. Count the
+          # rows that it actually adds and pad the same RemoteViews with blank 1/6 slots
+          # before Android is asked to update it. This shares exact spacing among tabs
+          # without altering text size or any item strings.
+          add_pat=re.compile(r'(?P<parent>\b[A-Za-z_$][\w$]*)\.addView\(\s*R\.id\.widget_rows\s*,\s*(?P<child>[A-Za-z_$][\w$]*)\s*\)')
+          add_found=add_pat.findall(source)
+          if not add_found:
+              raise RuntimeError('Could not locate widget_rows.addView call; native source shape changed')
+          source=add_pat.sub(lambda m: f'LastPlanRowBalancer.addContent({m.group("parent")}, {m.group("child")})',source)
+          
+          # Insert a row-padding action immediately before each widget update. This
+          # handles updates by integer ID, ID array, or ComponentName without depending
+          # on the widget-manager variable name or the first argument's syntax.
+          update_pat=re.compile(r'\bupdateAppWidget\s*\(')
+          updates=[]
+          for match in update_pat.finditer(source):
+              pos=match.end()-1
+              depth=0
+              commas=[]
+              quote=None
+              escaped=False
+              for j in range(pos,len(source)):
+                  ch=source[j]
+                  if quote:
+                      if escaped: escaped=False
+                      elif ch=='\\': escaped=True
+                      elif ch==quote: quote=None
+                      continue
+                  if ch in ('\"',"'"):
+                      quote=ch
+                  elif ch=='(':
+                      depth+=1
+                  elif ch==')':
+                      depth-=1
+                      if depth==0:
+                          break
+                  elif ch==',' and depth==1:
+                      commas.append(j)
+              else: raise RuntimeError('Unbalanced updateAppWidget(...) Java expression')
+              if len(commas)!=1:
+                  # Calls with an unsupported signature are left unchanged; require at
+                  # least one supported real widget-update site before enabling layout.
+                  continue
+              remote=source[commas[-1]+1:j].strip()
+              if not re.fullmatch(r'[A-Za-z_$][\w$]*',remote):
+                  continue
+              updates.append((match.start(),remote))
+          if not updates:
+              raise RuntimeError('Could not identify RemoteViews variable in widget updates')
+          # Position the padding before the complete statement, not inside a call.
+          for start,remote in sorted(updates,reverse=True):
+              line_start=source.rfind('\n',0,start)+1
+              prefix=source[line_start:start]
+              if not prefix.lstrip().strip().endswith('.') or ';' in prefix:
+                  raise RuntimeError('Unusual widget update call structure: '+prefix[-70:])
+              indent=re.match(r'[ \t]*',prefix).group(0)
+              source=source[:line_start]+f'{indent}LastPlanRowBalancer.pad({remote});\n'+source[line_start:]
+          update_found=[x[1] for x in updates]
+          
+          # Some provider paths reuse a RemoteViews during onAppWidgetOptionsChanged.
+          # Reset the count whenever a widget row container is cleared.
+          reset_pat=re.compile(r'(?P<parent>\b[A-Za-z_$][\w$]*)\.removeAllViews\(\s*R\.id\.widget_rows\s*\)')
+          reset_found=reset_pat.findall(source)
+          source=reset_pat.sub(lambda m: f'LastPlanRowBalancer.reset({m.group("parent")})', source)
+          
+          # Standalone helper uses fully qualified Java class names so it introduces
+          # no import conflicts in the preexisting provider.
+          helper='''
+            // LASTPLAN_SIX_SLOT_SCALED_ROWS_V40
+            // Six equal resizing slots for all three widget tabs; unused slots are blank.
+            private static final class LastPlanRowBalancer {
+              private static final java.util.Map<android.widget.RemoteViews, Integer> COUNTS =
+                  java.util.Collections.synchronizedMap(new java.util.WeakHashMap<android.widget.RemoteViews, Integer>());
+          
+              static void reset(android.widget.RemoteViews parent) {
+                parent.removeAllViews(R.id.widget_rows);
+                COUNTS.put(parent, 0);
+              }
+              static void addContent(android.widget.RemoteViews parent, android.widget.RemoteViews row) {
+                parent.addView(R.id.widget_rows, row);
+                Integer count=COUNTS.get(parent);
+                COUNTS.put(parent, (count==null ? 0 : count)+1);
+              }
+              static void pad(android.widget.RemoteViews parent) {
+                Integer count=COUNTS.get(parent);
+                if (count == null) return;  // Other unrelated RemoteViews are unchanged.
+                for (int i=count; i<6; i++) {
+                  parent.addView(R.id.widget_rows,
+                    new android.widget.RemoteViews("com.lastplan.app", R.layout.widget_row_balancer));
+                }
+                COUNTS.remove(parent);
+              }
+            }
+          '''
+          # Insert the helper just before the class's final closing brace, not into an inner block.
+          if not source.rstrip().endswith('}'):
+              raise RuntimeError('Unexpected Java class ending')
+          pos=source.rfind('}')
+          source=source[:pos]+helper+'\n'+source[pos:]
+          java.write_text(source,encoding='utf-8')
+          
+          # The app already offers four native-supported text-size choices in Widget
+          # Settings. Add visible +/- controls using the very same existing setting and
+          # native bridge; do NOT create a second persistence value or change default.
+          html=assets.read_text(encoding='utf-8')
+          if html.count('id="widgetFontChoice"')!=1:
+              raise RuntimeError('Expected existing widget font choice exactly once')
+          selpat=re.compile(r'<select\s+id="widgetFontChoice"[^>]*>[\s\S]*?</select>')
+          sel=selpat.search(html)
+          if sel is None: raise RuntimeError('Existing widget font-size dropdown unavailable')
+          plus='''
+                        <div id="lpWidgetFontStepper" class="lp-widget-font-stepper" role="group" aria-label="위젯 글씨 크기 조절">
+                          <button type="button" id="lpWidgetFontMinus" aria-label="위젯 글씨 작게">−</button>
+                          <strong id="lpWidgetFontCurrent" aria-live="polite">보통</strong>
+                          <button type="button" id="lpWidgetFontPlus" aria-label="위젯 글씨 크게">＋</button>
+                        </div>'''
+          html=html[:sel.end()]+plus+html[sel.end():]
+          css='''
+          <style id="lastplan-widget-font-stepper-v40">
+          #lpWidgetFontStepper{display:flex;align-items:center;justify-content:space-between;gap:9px;margin:8px 0 15px;max-width:100%;}
+          #lpWidgetFontStepper button{width:51px;min-height:43px;border:1px solid rgba(220,193,138,.6);border-radius:7px;background:#1A1D23;color:#EBD3A4;font-size:26px;cursor:pointer;}
+          #lpWidgetFontCurrent{flex:1;text-align:center;color:#F4F4F4;font-size:15px;font-weight:700;}
+          </style>
+          <script id="lastplan-widget-font-stepper-v40">
+          (function(){
+            function init(){
+              const select=document.getElementById('widgetFontChoice');
+              const minus=document.getElementById('lpWidgetFontMinus');
+              const plus=document.getElementById('lpWidgetFontPlus');
+              const current=document.getElementById('lpWidgetFontCurrent');
+              if(!select||!minus||!plus||!current)return;
+              const labels=['작게','보통 (기본값)','크게','아주 크게'];
+              function sync(){
+                const v=Math.max(0,Math.min(3,Number(select.value)||0));
+                current.textContent=labels[v];
+                minus.disabled=v===0;plus.disabled=v===3;
+                minus.style.opacity=v===0?'.4':'1';plus.style.opacity=v===3?'.4':'1';
+              }
+              function adjust(delta){
+                select.value=String(Math.max(0,Math.min(3,Number(select.value)+delta)));
+                select.dispatchEvent(new Event('change',{bubbles:true}));
+                sync();
+              }
+              minus.addEventListener('click',()=>adjust(-1));
+              plus.addEventListener('click',()=>adjust(1));
+              select.addEventListener('change',sync);
+              sync();
+              // Existing native bridge may populate this selector during page startup.
+              requestAnimationFrame(sync);
+            }
+            if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);
+            else init();
+          })();
+          </script>
+          '''
+          if '<body' not in html: raise RuntimeError('HTML body missing')
+          # This app has multiple legacy style blocks after </body>; placing before the
+          # original close-body keeps the new controls in the same WebView document.
+          if html.count('</body>')!=1: raise RuntimeError('Expected one HTML body close')
+          html=html.replace('</body>',css+'\n</body>',1)
+          assets.write_text(html,encoding='utf-8')
+          
+          print('V40 spacing: 6 equal growth slots across Today/Guild War/Survival; text sp unchanged')
+          print('Native addView patterns:',len(add_found),'updates:',len(update_found),'resets:',len(reset_found))
+          print('Updated row layouts:', ', '.join(changed))
+          print('Widget Settings: original 4 levels kept, +/- size controls added')
+          PY
+
       - name: Restore signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
