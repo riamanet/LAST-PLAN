@@ -205,77 +205,92 @@ jobs:
           print('In-app gift icon, unread badge and coupon panel installed')
           PY
 
-      - name: Settings tab replaces coupon gift with admin mode switch
+      - name: Fix Settings admin mode button in the gift position
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
           path = Path('build-src/LAST_PLAN_Android/app/src/main/assets/index.html')
           html = path.read_text(encoding='utf-8')
-          marker = 'lastplan-settings-gift-admin-v1'
+          marker = 'lastplan-settings-admin-stable-v2'
           if marker in html:
-              print('Settings gift/admin switch already present')
+              print('Stable Settings admin mode button already included')
               raise SystemExit(0)
 
-          # Reuse the real administrator-mode button and its existing click
-          # listener/permission enforcement. Do not invent a parallel admin login.
-          old = "    const isSettings = key === 'settings';"
-          new = old + "\n    memberMode.classList.toggle('lp-settings-tab', isSettings);"
-          if html.count(old) != 1:
-              raise RuntimeError('Could not find exactly one Settings-tab handler')
-          html = html.replace(old, new, 1)
+          # Keep the SAME original permission-checked button and click handler.
+          # The #38 runtime move was fragile: put the button in the header
+          # directly in HTML so it is present before any app scripts run.
+          original_button = '            <button id="memberSettingsModeSwitch" class="settings-mode-switch" type="button" hidden>관리자모드</button>\n'
+          if html.count(original_button) != 1:
+              raise RuntimeError('Original administrator mode button not found exactly once')
+          html = html.replace(original_button, '', 1)
+          header_anchor = '        <div class="member-line"></div>\n      </header>'
+          if html.count(header_anchor) != 1:
+              raise RuntimeError('Member header structure changed')
+          new_header = '        <div class="member-line"></div>\n' + original_button + '      </header>'
+          html = html.replace(header_anchor, new_header, 1)
 
-          # Prevent the original mode-sync routine from displaying the button
-          # on non-Settings tabs after it has been moved into the guild header.
-          old = "      memberSettingsModeSwitch.hidden = !canManage || mode !== 'member';"
-          new = "      memberSettingsModeSwitch.hidden = !canManage || mode !== 'member' || !memberMode.classList.contains('lp-settings-tab');"
-          if html.count(old) != 1:
-              raise RuntimeError('Could not find the original admin-button permission check')
-          html = html.replace(old, new, 1)
+          # The Settings class drives ONLY the visual swap. Every other tab
+          # retains the gift icon, and the button is hidden there.
+          tab_anchor = "    const isSettings = key === 'settings';"
+          if html.count(tab_anchor) != 1:
+              raise RuntimeError('Settings tab activation not found exactly once')
+          html = html.replace(tab_anchor,
+                  tab_anchor + "\n    memberMode.classList.toggle('lp-settings-tab', isSettings);", 1)
 
-          style = '''<style id="lastplan-settings-gift-admin-v1">
-          /* In member Settings ONLY, use the gift-icon position for the
-             original administrator-mode switch. Gifts remain on other tabs. */
-          #memberMode .member-top {position:relative;}
-          #memberMode.lp-settings-tab .member-top .lp-gift-trigger {display:none!important;}
-          #memberMode .member-top #memberSettingsModeSwitch {
-            position:absolute;right:-4px;top:4px;z-index:19;
-            min-width:91px;width:auto;height:43px;padding:0 9px;
-            border:1px solid rgba(194,207,222,.52);border-radius:8px;
-            background:linear-gradient(155deg,rgba(45,54,66,.98),rgba(9,13,20,.97));
-            box-shadow:0 3px 15px rgba(0,0,0,.45),inset 0 1px rgba(241,247,255,.20);
-            color:#dde5ef;font-size:12px;font-weight:750;line-height:1;
-            display:flex;align-items:center;justify-content:center;
-            white-space:nowrap;touch-action:manipulation;
+          # The general mode synchronization must consult the selected tab;
+          # it no longer controls an unrelated header position.
+          original_sync = "      memberSettingsModeSwitch.hidden = !canManage || mode !== 'member';"
+          if html.count(original_sync) != 1:
+              raise RuntimeError('Original administrator switch sync not found')
+          new_sync = ("      const isMemberSettings = !!memberTabs.querySelector('.member-tab[data-key=\"settings\"].active');\n"
+                      "      memberSettingsModeSwitch.hidden = !(canManage && mode === 'member' && isMemberSettings);")
+          html = html.replace(original_sync, new_sync, 1)
+
+          # renderMemberSettings calls syncModeControls. Explicitly set the
+          # button again at the END of activation, after that render returns.
+          old_render = '    if(isSettings) renderMemberSettings();'
+          new_render = '''    if(isSettings){
+              renderMemberSettings();
+              if(memberSettingsModeSwitch){
+                memberSettingsModeSwitch.hidden = !currentUserCanManage();
+                memberSettingsModeSwitch.textContent = '관리자모드';
+              }
+            }'''
+          if html.count(old_render) != 1:
+              raise RuntimeError('Member Settings render location not found')
+          html = html.replace(old_render, new_render, 1)
+
+          style = '''<style id="lastplan-settings-admin-stable-v2">
+          #memberMode .member-top{position:relative!important;}
+          /* Settings icon position: replace gift ONLY on Settings. */
+          #memberMode.lp-settings-tab .member-top .lp-gift-trigger{display:none!important;}
+          #memberMode .member-top #memberSettingsModeSwitch{
+            position:absolute!important;right:-4px!important;top:3px!important;
+            z-index:1000!important;min-width:88px;height:40px;padding:0 8px;
+            border:1px solid rgba(194,207,222,.58);border-radius:8px;
+            background:linear-gradient(155deg,#343d4b,#11151d);
+            box-shadow:0 2px 12px rgba(0,0,0,.4);
+            color:#e3e9f1;font-size:12px;font-weight:700;
+            align-items:center;justify-content:center;white-space:nowrap;
+            cursor:pointer;
           }
-          #memberMode .member-top #memberSettingsModeSwitch[hidden] {display:none!important;}
-          @media(max-width:390px){
-            #memberMode .member-top #memberSettingsModeSwitch{right:-4px;top:3px;height:39px;min-width:85px;font-size:11px;}
+          #memberMode .member-top #memberSettingsModeSwitch:not([hidden]){
+            display:flex!important;opacity:1!important;visibility:visible!important;
+            pointer-events:auto!important;
           }
+          #memberMode .member-top #memberSettingsModeSwitch[hidden]{display:none!important;}
           </style>'''
           if html.count('</head>') != 1:
-              raise RuntimeError('Unexpected HTML head structure')
+              raise RuntimeError('HTML head structure changed')
           html = html.replace('</head>', style + '\n</head>', 1)
 
-          # The original control stays the SAME DOM element, with its working
-          # switchModeFromCompactButton('admin') event listener attached.
-          move = '''<script>
-          (() => {
-            const header = document.querySelector('#memberMode .member-top');
-            const button = document.getElementById('memberSettingsModeSwitch');
-            if (!header || !button) return;
-            header.appendChild(button);
-          })();
-          </script>'''
           if html.count('id="memberSettingsModeSwitch"') != 1:
-              raise RuntimeError('Admin mode control missing or duplicated')
+              raise RuntimeError('Administrator control duplicated or missing')
           if html.count("switchModeFromCompactButton('admin')") != 1:
-              raise RuntimeError('Admin mode action missing or duplicated')
-          if html.count('</body>') != 1:
-              raise RuntimeError('Unexpected HTML body structure')
-          html = html.replace('</body>', move + '\n</body>', 1)
+              raise RuntimeError('Original administrator click action missing')
           path.write_text(html, encoding='utf-8')
-          print('Settings: hidden gift; existing authorized Admin-mode button moved to gift position. All other tabs keep gift.')
+          print('Settings: gift hidden; existing admin button anchored in header and re-synced after settings render')
           PY
 
       - name: Lower member bottom menu without changing its five buttons
@@ -477,10 +492,10 @@ jobs:
           footer.set(a('layout_marginTop'), '2dp')
           tree.write(main, encoding='utf-8', xml_declaration=True)
 
-          # A RemoteViews child inherits its root layout parameters when
-          # added to widget_rows. Each row must have height=0dp + weight=1.
-          # Its inner colored bar/text also fills the row so text stays
-          # vertically centered and highlight backgrounds follow the size.
+          # Rows used to have weight=1, so with only 3 tasks each row
+          # stretched to one third of the entire large widget. Instead,
+          # cap each row at a readable height. The parent still fills the
+          # widget so the app button remains anchored at the bottom.
           changed = []
           for path in sorted((base / 'layout').glob('widget_row_*.xml')):
               tree = ET.parse(path)
@@ -502,12 +517,17 @@ jobs:
                   other = [c for c in root if c is not body]
                   if len(other) != 1 or not other[0].tag.endswith('TextView'):
                       continue
-              root.set(a('layout_height'), '0dp')
-              root.set(a('layout_weight'), '1')
+              # 3-4 task views may expand modestly, but never balloon.
+              # Six Survival rows stay compact and legible.
+              is_survival = 'survival' in path.name
+              is_guildwar = 'guild' in path.name or 'war' in path.name
+              body_height = '30dp' if is_survival else ('48dp' if is_guildwar else '40dp')
+              root.set(a('layout_height'), 'wrap_content')
+              root.set(a('layout_weight'), '0')
               root.set(a('orientation'), 'vertical')
               root.set(a('minHeight'), '0dp')
-              body.set(a('layout_height'), '0dp')
-              body.set(a('layout_weight'), '1')
+              body.set(a('layout_height'), body_height)
+              body.set(a('layout_weight'), '0')
               body.set(a('minHeight'), '0dp')
               body.set(a('paddingTop'), '1dp')
               body.set(a('paddingBottom'), '1dp')
@@ -534,7 +554,7 @@ jobs:
               root.set(a('targetCellHeight'), '4')
               info_tree.write(info, encoding='utf-8', xml_declaration=True)
 
-          print('Adaptive widget: card fills host height, visible rows share available space')
+          print('Widget card fills host height; task row height is capped (no excessive gaps)')
           print('Updated row variants: ' + ', '.join(changed))
           PY
 
