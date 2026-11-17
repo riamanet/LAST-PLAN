@@ -205,6 +205,79 @@ jobs:
           print('In-app gift icon, unread badge and coupon panel installed')
           PY
 
+      - name: Settings tab replaces coupon gift with admin mode switch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('build-src/LAST_PLAN_Android/app/src/main/assets/index.html')
+          html = path.read_text(encoding='utf-8')
+          marker = 'lastplan-settings-gift-admin-v1'
+          if marker in html:
+              print('Settings gift/admin switch already present')
+              raise SystemExit(0)
+
+          # Reuse the real administrator-mode button and its existing click
+          # listener/permission enforcement. Do not invent a parallel admin login.
+          old = "    const isSettings = key === 'settings';"
+          new = old + "\n    memberMode.classList.toggle('lp-settings-tab', isSettings);"
+          if html.count(old) != 1:
+              raise RuntimeError('Could not find exactly one Settings-tab handler')
+          html = html.replace(old, new, 1)
+
+          # Prevent the original mode-sync routine from displaying the button
+          # on non-Settings tabs after it has been moved into the guild header.
+          old = "      memberSettingsModeSwitch.hidden = !canManage || mode !== 'member';"
+          new = "      memberSettingsModeSwitch.hidden = !canManage || mode !== 'member' || !memberMode.classList.contains('lp-settings-tab');"
+          if html.count(old) != 1:
+              raise RuntimeError('Could not find the original admin-button permission check')
+          html = html.replace(old, new, 1)
+
+          style = '''<style id="lastplan-settings-gift-admin-v1">
+          /* In member Settings ONLY, use the gift-icon position for the
+             original administrator-mode switch. Gifts remain on other tabs. */
+          #memberMode .member-top {position:relative;}
+          #memberMode.lp-settings-tab .member-top .lp-gift-trigger {display:none!important;}
+          #memberMode .member-top #memberSettingsModeSwitch {
+            position:absolute;right:-4px;top:4px;z-index:19;
+            min-width:91px;width:auto;height:43px;padding:0 9px;
+            border:1px solid rgba(194,207,222,.52);border-radius:8px;
+            background:linear-gradient(155deg,rgba(45,54,66,.98),rgba(9,13,20,.97));
+            box-shadow:0 3px 15px rgba(0,0,0,.45),inset 0 1px rgba(241,247,255,.20);
+            color:#dde5ef;font-size:12px;font-weight:750;line-height:1;
+            display:flex;align-items:center;justify-content:center;
+            white-space:nowrap;touch-action:manipulation;
+          }
+          #memberMode .member-top #memberSettingsModeSwitch[hidden] {display:none!important;}
+          @media(max-width:390px){
+            #memberMode .member-top #memberSettingsModeSwitch{right:-4px;top:3px;height:39px;min-width:85px;font-size:11px;}
+          }
+          </style>'''
+          if html.count('</head>') != 1:
+              raise RuntimeError('Unexpected HTML head structure')
+          html = html.replace('</head>', style + '\n</head>', 1)
+
+          # The original control stays the SAME DOM element, with its working
+          # switchModeFromCompactButton('admin') event listener attached.
+          move = '''<script>
+          (() => {
+            const header = document.querySelector('#memberMode .member-top');
+            const button = document.getElementById('memberSettingsModeSwitch');
+            if (!header || !button) return;
+            header.appendChild(button);
+          })();
+          </script>'''
+          if html.count('id="memberSettingsModeSwitch"') != 1:
+              raise RuntimeError('Admin mode control missing or duplicated')
+          if html.count("switchModeFromCompactButton('admin')") != 1:
+              raise RuntimeError('Admin mode action missing or duplicated')
+          if html.count('</body>') != 1:
+              raise RuntimeError('Unexpected HTML body structure')
+          html = html.replace('</body>', move + '\n</body>', 1)
+          path.write_text(html, encoding='utf-8')
+          print('Settings: hidden gift; existing authorized Admin-mode button moved to gift position. All other tabs keep gift.')
+          PY
+
       - name: Lower member bottom menu without changing its five buttons
         run: |
           python3 - <<'PY'
