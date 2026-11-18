@@ -836,6 +836,110 @@ jobs:
           print('Widget Settings: original 4 levels kept, +/- size controls added')
           PY
 
+      - name: Recover existing online guild membership before rejoining
+        run: |
+          python3 - <<'PY'
+          """Safe online guild re-entry patch for LAST PLAN.
+          
+          The server-returned Firebase membership role remains the only source of authority.
+          Never derive permissions from these local hints.
+          """
+          from pathlib import Path
+          import sys
+          
+          path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('build-src/LAST_PLAN_Android/app/src/main/assets/index.html')
+          src = path.read_text(encoding='utf-8')
+          marker = 'LASTPLAN_RESUME_MEMBERSHIP_BEFORE_JOIN_V41'
+          if marker in src:
+              print('Safe online re-entry already patched')
+              raise SystemExit(0)
+          
+          anchor = '  function onlineGuildLogin(result, code){'
+          assert src.count(anchor) == 1, f'Expected one onlineGuildLogin, got {src.count(anchor)}'
+          helper = r'''  // LASTPLAN_RESUME_MEMBERSHIP_BEFORE_JOIN_V41
+            // This storage is ONLY a discovery hint. Server resumeGuild decides the role.
+            const LAST_PLAN_MEMBERSHIP_HINTS = 'lastPlanOnlineMembershipHintsV41';
+            function loadOnlineMembershipHints(){
+              try {
+                const value = JSON.parse(localStorage.getItem(LAST_PLAN_MEMBERSHIP_HINTS) || '{}');
+                return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+              } catch(_) { return {}; }
+            }
+            function rememberOnlineMembership(result, code){
+              if(!result?.guildId || !result?.uid || !result?.name) return;
+              const key = normalizeKey(result.name, code);
+              const hints = loadOnlineMembershipHints();
+              hints[key] = {guildId:result.guildId, uid:result.uid,
+                role:onlineRole(result.role), updatedAt:Date.now()};
+              try { localStorage.setItem(LAST_PLAN_MEMBERSHIP_HINTS, JSON.stringify(hints)); }catch(_){}
+            }
+            async function resumeOrJoinOnlineGuild(name, code){
+              const key = normalizeKey(name, code);
+              const uid = String(online?.uid || '');
+              if(!uid) throw new Error('Firebase 인증 ID가 없습니다. 인터넷 연결을 확인해주세요.');
+              const guild = loadGuilds()[key];
+              const hint = loadOnlineMembershipHints()[key];
+              const previous = guild?.online && guild.guildId ? guild : null;
+              const deviceMember = previous?.members?.[getDeviceId()];
+              const storedMember = localStorage.getItem('guildScheduleCurrentGuild') === key
+                ? getSavedSessionMember() : null;
+              const ownerUid = (hint?.uid || deviceMember?.memberId || storedMember?.memberId || '');
+              const knownGuildId = hint?.guildId || previous?.guildId;
+              if(knownGuildId && ownerUid === uid){
+                // Crucial: do NOT call joinGuild for an already enrolled administrator.
+                // Joining could turn the same UID into a regular member on some servers.
+                try { return await online.resumeGuild(knownGuildId); }
+                catch(e){
+                  const error = new Error('기존 길드 권한을 확인하지 못했습니다. 앱 데이터를 삭제하지 말고 기존 계정으로 다시 접속하세요.');
+                  error.code = 'MEMBERSHIP_RESUME_FAILED';
+                  throw error;
+                }
+              }
+              const previouslyPrivileged = hint?.role === '길드장' || hint?.role === '관리자'
+                || deviceMember?.role === '길드장' || deviceMember?.role === '관리자';
+              if(knownGuildId && ownerUid && ownerUid !== uid && previouslyPrivileged){
+                const error = new Error('현재 Firebase 사용자 ID가 기존 관리자 계정과 다릅니다. 비밀번호만으로 권한을 복원할 수 없으므로 앱 데이터를 삭제하지 말고 운영자에게 계정 복구를 요청하세요.');
+                error.code = 'MEMBERSHIP_UID_CHANGED';
+                throw error;
+              }
+              // First-time member joins remain unchanged and receive server-defined roles.
+              return await online.joinGuild(name, code, '길드원');
+            }
+          '''
+          src = src.replace(anchor, helper + anchor, 1)
+          record_anchor = "    const member={memberId:result.uid,nickname:result.nickname||'길드원',\n      role:onlineRole(result.role),joinedAt:new Date().toISOString()};"
+          assert src.count(record_anchor) == 1, f'Expected one online member record, got {src.count(record_anchor)}'
+          src = src.replace(record_anchor, record_anchor + '\n    rememberOnlineMembership(result, code);', 1)
+          old_login = ".then(()=>online.joinGuild(name,code,'길드원'))"
+          assert src.count(old_login) == 1, f'Expected one online join path, got {src.count(old_login)}'
+          src = src.replace(old_login, '.then(()=>resumeOrJoinOnlineGuild(name,code))', 1)
+          err_anchor = "            if(/guild_not_found|not.found|guild.*missing/i.test(code)){"
+          assert src.count(err_anchor) == 1
+          src = src.replace(err_anchor, "            if(/MEMBERSHIP_RESUME_FAILED|MEMBERSHIP_UID_CHANGED/.test(code)){\n              showAppDialog(error.message,'관리자 계정 확인');\n            }else if(/guild_not_found|not.found|guild.*missing/i.test(code)){", 1)
+          assert src.count(marker) == 1
+          path.write_text(src, encoding='utf-8')
+          print('Patched LAST PLAN online relogin: resume existing UID first; no client-side privilege escalation.')
+          PY
+
+      - name: Collect guild identity source for server-safe rename implementation
+        run: |
+          set -euo pipefail
+          SOURCE="build-src/LAST_PLAN_Android"
+          mkdir -p guild-identity-source
+          BRIDGE=$(find "$SOURCE/app/src/main/java" -type f -name 'LastPlanBridge.java' -print -quit)
+          test -n "$BRIDGE" || (echo "LastPlanBridge.java missing" && exit 1)
+          cp "$BRIDGE" guild-identity-source/LastPlanBridge.java
+          RULES=$(find "$SOURCE" -type f -name 'firestore.rules' -print -quit)
+          if [ -n "$RULES" ]; then cp "$RULES" guild-identity-source/firestore.rules; fi
+          echo "Native bridge captured for verifying guild rename access checks; no keys or secrets included."
+
+      - name: Upload guild identity source for later native rename fix
+        uses: actions/upload-artifact@v4
+        with:
+          name: LASTPLAN-GUILD-IDENTITY-SOURCE
+          path: guild-identity-source/
+          if-no-files-found: error
+
       - name: Restore signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
