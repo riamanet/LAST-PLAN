@@ -985,6 +985,8 @@ jobs:
                       DocumentReference guild = db.collection("guilds").document(gid);
                       DocumentReference myself = guild.collection("members").document(uid);
                       String now = nowIso();
+                      // Compute the new SHA-256 before entering Firestore's callback: hashJoin throws a checked Exception.
+                      String newHash = hashJoin(newName, joinCode);
                       db.runTransaction(tx -> {
                           // Firestore transactions must read all documents before writing.
                           DocumentSnapshot oldGuild = tx.get(guild);
@@ -997,11 +999,18 @@ jobs:
                           String oldName = safe(oldGuild.getString("name"));
                           String currentHash = safe(oldGuild.getString("joinCodeHash"));
                           if (newName.equals(oldName)) throw new IllegalArgumentException("guild_name_unchanged");
-                          if (!currentHash.equals(hashJoin(oldName, joinCode))
-                                  && !currentHash.equals(legacyHashJoin(oldName, joinCode))) {
+                          // Transaction lambdas cannot propagate the checked exceptions from these hash helpers.
+                          String oldModernHash;
+                          String oldLegacyHash;
+                          try {
+                              oldModernHash = hashJoin(oldName, joinCode);
+                              oldLegacyHash = legacyHashJoin(oldName, joinCode);
+                          } catch (Exception hashError) {
+                              throw new IllegalStateException("guild_hash_failed", hashError);
+                          }
+                          if (!currentHash.equals(oldModernHash) && !currentHash.equals(oldLegacyHash)) {
                               throw new IllegalArgumentException("guild_code_mismatch");
                           }
-                          String newHash = hashJoin(newName, joinCode);
                           if (newHash.equals(currentHash)) throw new IllegalArgumentException("guild_name_hash_unchanged");
                           DocumentReference oldDirectory = db.collection("guildDirectory").document(currentHash);
                           DocumentReference newDirectory = db.collection("guildDirectory").document(newHash);
