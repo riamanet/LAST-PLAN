@@ -927,6 +927,23 @@ jobs:
           print('Patched LAST PLAN online relogin: resume existing UID first; no client-side privilege escalation.')
           PY
 
+      - name: Locate original Firestore rules in Android project
+        run: |
+          set -euo pipefail
+          ROOT='build-src/LAST_PLAN_Android'
+          TARGET="$ROOT/firestore.rules"
+          if [ -f "$TARGET" ]; then
+            echo 'Original firestore.rules is already at the project root.'
+          else
+            mapfile -d '' MATCHES < <(find "$ROOT" -type f -name 'firestore.rules' -print0)
+            if [ "${#MATCHES[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one original firestore.rules; found ${#MATCHES[@]}. No Firebase settings have been changed."
+              exit 1
+            fi
+            cp "${MATCHES[0]}" "$TARGET"
+            echo 'Staged the original rules for local build and tests; no Firebase deployment performed.'
+          fi
+
       - name: Enable safe online guild-name change only
         run: |
           python3 - <<'PY'
