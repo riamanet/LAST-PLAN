@@ -1,0 +1,1318 @@
+name: Build LAST PLAN APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'LAST_PLAN_Android_Project.zip'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK packages
+        run: |
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Unzip LAST PLAN project
+        run: |
+          rm -rf build-src
+          mkdir -p build-src
+          unzip -q LAST_PLAN_Android_Project.zip -d build-src
+
+      - name: Center guild login field text
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          index = Path('build-src/LAST_PLAN_Android/app/src/main/assets/index.html')
+          source = index.read_text(encoding='utf-8')
+          anchor = '/* Use a single final baseline offset for both placeholder and typed values.'
+          start = source.find(anchor)
+          if start == -1:
+              raise RuntimeError('Expected login input alignment styles were not found')
+          end = source.find('</style>', start)
+          block = source[start:end]
+          before = 'transform:translateY(-2px)!important;'
+          after = 'transform:translateY(2px)!important;'
+          if block.count(before) != 1:
+              raise RuntimeError('Expected login baseline rule was not found exactly once')
+          source = source[:start] + block.replace(before, after, 1) + source[end:]
+          # Keep the guild name at +2px; lower only the guild code to +4px.
+          if source.count('id="loginGuildCode"') != 1:
+              raise RuntimeError('Expected login guild code field was not found exactly once')
+          rule = '\n#loginScreen #loginGuildCode{transform:translateY(4px)!important;}\n'
+          style_end = source.find('</style>', start)
+          source = source[:style_end] + rule + source[style_end:]
+          index.write_text(source, encoding='utf-8')
+          print('Guild name: +2px; guild code: +4px (additional 2px lower).')
+          PY
+
+      - name: Include guild name in bug reports
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          assets = Path('build-src/LAST_PLAN_Android/app/src/main/assets')
+          index = assets / 'index.html'
+          source = index.read_text(encoding='utf-8')
+          target = '      guildId:ctx.guild.guildId||ctx.key,'
+          if source.count(target) != 1:
+              raise RuntimeError('Bug-report guild field not found exactly once')
+          source = source.replace(
+              target,
+              target + "\n      guildName:String(ctx.guild.guildName||'').trim(),",
+              1
+          )
+          index.write_text(source, encoding='utf-8')
+
+          bridge = assets / 'firebase-sync.js'
+          source = bridge.read_text(encoding='utf-8')
+          old = "id: report.id, content: report.content, screen: report.screen || ''"
+          new = (
+              "id: report.id, content: report.content, "
+              "screen: JSON.stringify({__lastPlanGuildMeta:1, "
+              "guildName:String(report.guildName||'').trim(), "
+              "screen:String(report.screen||'')})"
+          )
+          if source.count(old) != 1:
+              raise RuntimeError('Bug-report Firebase bridge not found exactly once')
+          source = source.replace(old, new, 1)
+          bridge.write_text(source, encoding='utf-8')
+          print('Guild names will be included in new bug reports.')
+          PY
+
+      - name: Add gift coupon panel inside LAST PLAN
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64, gzip, hashlib
+
+          assets = Path('build-src/LAST_PLAN_Android/app/src/main/assets')
+          index = assets / 'index.html'
+          html = index.read_text(encoding='utf-8')
+          tag = '<script src="lastplan-coupon.js"></script>'
+          if tag not in html:
+              if html.count('</body>') != 1:
+                  raise RuntimeError('HTML body closing tag not found exactly once')
+              html = html.replace('</body>', tag + '\n</body>', 1)
+              index.write_text(html, encoding='utf-8')
+
+          payload = (
+          'H4sIAAAAAAAC/608/XPbxpW/96/YyG0IpiQEgN+kpJwiK7Fjx3Yt5dyLRuOCwJJEBAI8ANRHFM347jydTJOZuHPxJe04PXfapE0vM+dp3Gs6Tedm+qfkR5P+'
+          'H+693QWwAEmJvbvYlsDdt/vevu/3sMzqS+T65s4uuXV980abOF7ZHI1I3+lFZcu3KRmZHnWJcqgXVXLDJ67fdzyySvpjx7WJbUYmGY4jM3J8TyUvrX5HUYpk'
+          'fYOcfoeQwjikJIwCx4oKHfjs9Ihy5Hi2f6TeveuaYXTLNb0tfzzyvVuI5DY17ZMiCWg0DjxccCEwWSdRMKad7wCw5XthRF578+rl7btbNy9v78BkYRBFo7C9'
+          'uhqYR2rfiQbjLtAUAGhEvUi1/OFq4JhD2C9aRRxlMzxxx8MyHM6mq0PT8VaRB6H6duh77Awylu0bl2/dvHpjV0YUWoEzitS+7/ddyhAMTSvww9VwdfNa78Tq'
+          'nuiXr26/9YPXG9Vu7drmW5thq0YPTw4PB1eutmrR8c2TUfmt7bf115ztrc3tN81aTT/ohdpW9e9v3e3pw7uj60e1/io9ppZEzps725fvXtv+ByQEjzECVt2F'
+          'g9p3Lcaw8O6hLoFvbW5d2Z6B56B3LZAoyDi7Ymd3c/fqFoCjWHEQeNIme4Xrm9eu3rhs1AsleKzUtGv1rRvs+bXbmzfEsFHf2nx1W2fP+BRDa3carxpvcJDa'
+          'neaWeNTuvPJWiz3qtTu3blQv8+ebd1qvNn7Ini9vbf9QN4wK+3Dttl671tqMn41rjZvxM1BznT3funbzdqPR4M+vb96Knzd3+NOd67swAQ91/cqd6nXcLDpy'
+          'zVG9Xo8fm81mYb/EDt91feuA2vz4V+LD37y2K5706vYrtzkXfnD1h1dhVCwcj8BacGHB0Ix6WdfLeqUAM2cpn60wBCb/iIFfYhZ2xR/SHSug1COqOyozsxyA'
+          '6p+O/NBBo2sH1AXrO6SdswuWgSH2+zTgIiQk2cDshr47jmgH5gdRu6yPjjuRP2pX4fc7ZTBBetzWmx2xzHZCUJeTds+lx523x2Hk9E7KwqDaFvygQcd0nb5X'
+          'diI6DOMhsfrIsaNBu1qBrQeUoWPPI9O2Ha/f1jpdP7BpUA5M2xmH7SbMiZV8og3EESDXsUnQ75qK3qqWDK1RMgyjpNaMYgJtWgf9wB97dtt1PGoG5T5uCbQo'
+          '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'
+          'AzAA2QF7RAAA'
+          )
+          script = gzip.decompress(base64.b64decode(payload))
+          expected_sha256 = 'e1a99c9b462932ad26e84088d63502a82f203261229b3b13a1238b8024f3f3e6'
+          if hashlib.sha256(script).hexdigest() != expected_sha256:
+              raise RuntimeError('Coupon script integrity check failed')
+          (assets / 'lastplan-coupon.js').write_bytes(script)
+          print('In-app gift icon, unread badge and coupon panel installed')
+          PY
+
+      - name: Fix Settings admin mode button in the gift position
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('build-src/LAST_PLAN_Android/app/src/main/assets/index.html')
+          html = path.read_text(encoding='utf-8')
+          marker = 'lastplan-settings-admin-stable-v2'
+          if marker in html:
+              print('Stable Settings admin mode button already included')
+              raise SystemExit(0)
+
+          # Keep the SAME original permission-checked button and click handler.
+          # The #38 runtime move was fragile: put the button in the header
+          # directly in HTML so it is present before any app scripts run.
+          original_button = '            <button id="memberSettingsModeSwitch" class="settings-mode-switch" type="button" hidden>관리자모드</button>\n'
+          if html.count(original_button) != 1:
+              raise RuntimeError('Original administrator mode button not found exactly once')
+          html = html.replace(original_button, '', 1)
+          header_anchor = '        <div class="member-line"></div>\n      </header>'
+          if html.count(header_anchor) != 1:
+              raise RuntimeError('Member header structure changed')
+          new_header = '        <div class="member-line"></div>\n' + original_button + '      </header>'
+          html = html.replace(header_anchor, new_header, 1)
+
+          # The Settings class drives ONLY the visual swap. Every other tab
+          # retains the gift icon, and the button is hidden there.
+          tab_anchor = "    const isSettings = key === 'settings';"
+          if html.count(tab_anchor) != 1:
+              raise RuntimeError('Settings tab activation not found exactly once')
+          html = html.replace(tab_anchor,
+                  tab_anchor + "\n    memberMode.classList.toggle('lp-settings-tab', isSettings);", 1)
+
+          # The general mode synchronization must consult the selected tab;
+          # it no longer controls an unrelated header position.
+          original_sync = "      memberSettingsModeSwitch.hidden = !canManage || mode !== 'member';"
+          if html.count(original_sync) != 1:
+              raise RuntimeError('Original administrator switch sync not found')
+          new_sync = ("      const isMemberSettings = !!memberTabs.querySelector('.member-tab[data-key=\"settings\"].active');\n"
+                      "      memberSettingsModeSwitch.hidden = !(canManage && mode === 'member' && isMemberSettings);")
+          html = html.replace(original_sync, new_sync, 1)
+
+          # renderMemberSettings calls syncModeControls. Explicitly set the
+          # button again at the END of activation, after that render returns.
+          old_render = '    if(isSettings) renderMemberSettings();'
+          new_render = '''    if(isSettings){
+              renderMemberSettings();
+              if(memberSettingsModeSwitch){
+                memberSettingsModeSwitch.hidden = !currentUserCanManage();
+                memberSettingsModeSwitch.textContent = '관리자모드';
+              }
+            }'''
+          if html.count(old_render) != 1:
+              raise RuntimeError('Member Settings render location not found')
+          html = html.replace(old_render, new_render, 1)
+
+          style = '''<style id="lastplan-settings-admin-stable-v2">
+          #memberMode .member-top{position:relative!important;}
+          /* Settings icon position: replace gift ONLY on Settings. */
+          #memberMode.lp-settings-tab .member-top .lp-gift-trigger{display:none!important;}
+          #memberMode .member-top #memberSettingsModeSwitch{
+            position:absolute!important;right:-4px!important;top:3px!important;
+            z-index:1000!important;min-width:88px;height:40px;padding:0 8px;
+            border:1px solid rgba(194,207,222,.58);border-radius:8px;
+            background:linear-gradient(155deg,#343d4b,#11151d);
+            box-shadow:0 2px 12px rgba(0,0,0,.4);
+            color:#e3e9f1;font-size:12px;font-weight:700;
+            align-items:center;justify-content:center;white-space:nowrap;
+            cursor:pointer;
+          }
+          #memberMode .member-top #memberSettingsModeSwitch:not([hidden]){
+            display:flex!important;opacity:1!important;visibility:visible!important;
+            pointer-events:auto!important;
+          }
+          #memberMode .member-top #memberSettingsModeSwitch[hidden]{display:none!important;}
+          </style>'''
+          if html.count('</head>') != 1:
+              raise RuntimeError('HTML head structure changed')
+          html = html.replace('</head>', style + '\n</head>', 1)
+
+          if html.count('id="memberSettingsModeSwitch"') != 1:
+              raise RuntimeError('Administrator control duplicated or missing')
+          if html.count("switchModeFromCompactButton('admin')") != 1:
+              raise RuntimeError('Original administrator click action missing')
+          path.write_text(html, encoding='utf-8')
+          print('Settings: gift hidden; existing admin button anchored in header and re-synced after settings render')
+          PY
+
+      - name: Lower member bottom menu without changing its five buttons
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('build-src/LAST_PLAN_Android/app/src/main/assets/index.html')
+          html = p.read_text(encoding='utf-8')
+          marker = 'lastplan-bottom-menu-position-v2'
+          if marker not in html:
+              css = '''<style id="lastplan-bottom-menu-position-v2">
+              /* The Android WebView reserves a large safe-area beneath the menu.
+                 Keep all five buttons, but remove the excessive inner bottom gap. */
+              #memberMode #memberTabs.member-tabs {
+                position: fixed !important;
+                bottom: 0 !important;
+                left: 0 !important;
+                right: 0 !important;
+                margin: 0 !important;
+                padding-bottom: 10px !important;
+                z-index: 900 !important;
+              }
+              </style>'''
+              if html.count('</head>') != 1:
+                  raise RuntimeError('Expected a single HTML head closing tag')
+              html = html.replace('</head>', css + '\n</head>', 1)
+              p.write_text(html, encoding='utf-8')
+          print('Lowered five-button member menu; removed oversized bottom safe-area padding')
+          PY
+
+      - name: Fit all six Survival Battle slots without any scrolling
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+
+          index = Path('build-src/LAST_PLAN_Android/app/src/main/assets/index.html')
+          html = index.read_text(encoding='utf-8')
+          marker = 'lastplan-stable-survival-layout-v2'
+          if marker not in html:
+              # Fix the original issue without the inner scrollbar.  The six
+              # time slots shrink evenly inside the available screen height.
+              css = '''<style id="lastplan-stable-survival-layout-v2">
+              #memberMode.lastplan-survival-fixed {
+                overflow-y: hidden !important;
+                overscroll-behavior-y: none !important;
+              }
+              #memberMode.lastplan-survival-fixed > .member-shell {
+                box-sizing: border-box !important;
+                height: 100% !important;
+                min-height: 0 !important;
+                display: flex !important;
+                flex-direction: column !important;
+                padding-bottom: calc(136px + env(safe-area-inset-bottom)) !important;
+              }
+              #memberMode.lastplan-survival-fixed .member-top,
+              #memberMode.lastplan-survival-fixed .billboard-strip {
+                flex: 0 0 auto !important;
+              }
+              #memberMode.lastplan-survival-fixed .member-content {
+                flex: 1 1 auto !important;
+                display: flex !important;
+                flex-direction: column !important;
+                min-height: 0 !important;
+                overflow: hidden !important;
+                margin-bottom: 0 !important;
+                padding-bottom: clamp(12px, 1.8vh, 24px) !important;
+              }
+              #memberMode.lastplan-survival-fixed .member-content-head {
+                flex: 0 0 auto !important;
+              }
+              #memberMode.lastplan-survival-fixed #memberSurvivalPanel.show {
+                flex: 1 1 auto !important;
+                min-height: 0 !important;
+                display: flex !important;
+                flex-direction: column !important;
+                margin-top: clamp(12px, 1.8vh, 20px) !important;
+              }
+              #memberMode.lastplan-survival-fixed #survivalDayTabs {
+                flex: 0 0 auto !important;
+                margin-bottom: clamp(6px, 1.0vh, 12px) !important;
+              }
+              #memberMode.lastplan-survival-fixed #survivalRows {
+                flex: 1 1 auto !important;
+                min-height: 0 !important;
+                grid-template-rows: repeat(6, minmax(0, 1fr)) !important;
+                gap: clamp(4px, .8vh, 7px) !important;
+                overflow: hidden !important;
+              }
+              #memberMode.lastplan-survival-fixed #survivalRows .common-row {
+                min-height: 0 !important;
+                height: 100% !important;
+                padding-top: clamp(3px, .6vh, 8px) !important;
+                padding-bottom: clamp(3px, .6vh, 8px) !important;
+              }
+              @media (max-height: 660px) {
+                #memberMode.lastplan-survival-fixed > .member-shell {
+                  padding-top: 3.5% !important;
+                  padding-bottom: calc(104px + env(safe-area-inset-bottom)) !important;
+                }
+                #memberMode.lastplan-survival-fixed .billboard-strip {
+                  margin-top: 12px !important;
+                  padding-top: 9px !important;
+                  padding-bottom: 9px !important;
+                }
+                #memberMode.lastplan-survival-fixed .member-content {
+                  margin-top: 10px !important;
+                  padding-top: 12px !important;
+                  padding-bottom: 9px !important;
+                }
+                #memberMode.lastplan-survival-fixed #memberSurvivalPanel.show {
+                  margin-top: 8px !important;
+                }
+                #memberMode.lastplan-survival-fixed #survivalDayTabs .common-day-tab {
+                  height: 30px !important;
+                }
+              }
+              </style>'''
+              if html.count('</head>') != 1:
+                  raise RuntimeError('Expected exactly one HTML head')
+              html = html.replace('</head>', css + '\n</head>', 1)
+
+              start = html.find('function activateMemberTab(tab){')
+              if start < 0:
+                  raise RuntimeError('Member tab handler missing')
+              end = html.find('function saveMemberTabOrder()', start)
+              if end < 0:
+                  raise RuntimeError('Member tab handler end missing')
+              fragment = html[start:end]
+              old = "    const isSurvival = key === 'survival';"
+              if fragment.count(old) != 1:
+                  raise RuntimeError('Expected one Survival tab flag')
+              new = old + "\n    memberMode.classList.toggle('lastplan-survival-fixed', isSurvival);\n    if (isSurvival) memberMode.scrollTop = 0;"
+              fragment = fragment.replace(old, new, 1)
+              html = html[:start] + fragment + html[end:]
+              index.write_text(html, encoding='utf-8')
+          print('Survival Battle: header and 6 full rows fixed, no inner or outer scroll')
+          PYCODE
+
+      - name: Adapt widget row spacing to actual home-screen widget height
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          base = Path('build-src/LAST_PLAN_Android/app/src/main/res')
+          A = '{http://schemas.android.com/apk/res/android}'
+          ET.register_namespace('android', 'http://schemas.android.com/apk/res/android')
+          def a(name): return A + name
+          def is_id(element, suffix):
+              return (element.get(a('id'), '')).endswith('/' + suffix)
+
+          # The previous fixed-height widget rows caused six entries to be
+          # clipped when Samsung Home resized the widget. Use measured parent
+          # height and Android LinearLayout weights instead of a fixed 34dp.
+          main = base / 'layout' / 'widget_last_plan.xml'
+          if not main.is_file():
+              raise RuntimeError('Widget host layout missing')
+          tree = ET.parse(main)
+          frame = tree.getroot()
+          if not frame.tag.endswith('FrameLayout'):
+              raise RuntimeError('Unexpected widget root; no changes written')
+          cards = [x for x in frame if x.tag.endswith('LinearLayout')]
+          if len(cards) != 1:
+              raise RuntimeError('Expected one vertical widget card container')
+          card = cards[0]
+          card.set(a('layout_height'), 'match_parent')
+          card.set(a('orientation'), 'vertical')
+          card.set(a('paddingTop'), '6dp')
+          card.set(a('paddingBottom'), '6dp')
+
+          widget_rows = [x for x in card.iter() if is_id(x, 'widget_rows')]
+          if len(widget_rows) != 1 or widget_rows[0] not in list(card):
+              raise RuntimeError('Widget rows must be a direct child of the card')
+          rows = widget_rows[0]
+          rows.set(a('layout_height'), '0dp')
+          rows.set(a('layout_weight'), '1')
+          rows.set(a('orientation'), 'vertical')
+          # Give the tabs and first row a clear gap, and keep the final
+          # row separated from the app button. Preserve the six flexible rows.
+          rows.set(a('paddingTop'), '12dp')
+          rows.set(a('paddingBottom'), '10dp')
+
+          # Keep header and actions fixed, leaving all extra (or reduced)
+          # space to be divided evenly among the visible rows.
+          header = [x for x in card.iter() if is_id(x, 'widget_header')]
+          if len(header) != 1:
+              raise RuntimeError('Missing widget header')
+          header[0].set(a('layout_height'), '24dp')
+          tab_containers = [x for x in card if any(is_id(c, 'widget_tab_survival') for c in x.iter())]
+          footer_containers = [x for x in card if any(is_id(c, 'widget_open_app') for c in x.iter())]
+          if len(tab_containers) != 1 or len(footer_containers) != 1:
+              raise RuntimeError('Missing widget tabs or footer')
+          tabs, footer = tab_containers[0], footer_containers[0]
+          if rows in (tabs, footer):
+              raise RuntimeError('Widget structural mismatch')
+          tabs.set(a('layout_height'), '32dp')
+          tabs.set(a('layout_marginTop'), '6dp')
+          footer.set(a('layout_height'), '30dp')
+          footer.set(a('layout_marginTop'), '2dp')
+          tree.write(main, encoding='utf-8', xml_declaration=True)
+
+          # Rows used to have weight=1, so with only 3 tasks each row
+          # stretched to one third of the entire large widget. Instead,
+          # cap each row at a readable height. The parent still fills the
+          # widget so the app button remains anchored at the bottom.
+          changed = []
+          for path in sorted((base / 'layout').glob('widget_row_*.xml')):
+              tree = ET.parse(path)
+              root = tree.getroot()
+              if not root.tag.endswith('LinearLayout'):
+                  continue
+              if len(root) < 2:
+                  continue
+              bodies = [child for child in root if child.tag.endswith('LinearLayout')]
+              if len(bodies) != 1:
+                  continue
+              body = bodies[0]
+              labels = [child for child in body if is_id(child, 'widget_row_time') or is_id(child, 'widget_row_title')]
+              if len(labels) != 2:
+                  continue
+              if not any(is_id(c, 'widget_row_divider') for c in root):
+                  # Some variants have an unlabelled divider. Any 1dp TextView
+                  # immediately following the body is an acceptable divider.
+                  other = [c for c in root if c is not body]
+                  if len(other) != 1 or not other[0].tag.endswith('TextView'):
+                      continue
+              # 3-4 task views may expand modestly, but never balloon.
+              # Six Survival rows stay compact and legible.
+              is_survival = 'survival' in path.name
+              is_guildwar = 'guild' in path.name or 'war' in path.name
+              body_height = '30dp' if is_survival else ('48dp' if is_guildwar else '40dp')
+              root.set(a('layout_height'), 'wrap_content')
+              root.set(a('layout_weight'), '0')
+              root.set(a('orientation'), 'vertical')
+              root.set(a('minHeight'), '0dp')
+              body.set(a('layout_height'), body_height)
+              body.set(a('layout_weight'), '0')
+              body.set(a('minHeight'), '0dp')
+              body.set(a('paddingTop'), '1dp')
+              body.set(a('paddingBottom'), '1dp')
+              for label in labels:
+                  label.set(a('layout_height'), 'match_parent')
+                  label.set(a('minHeight'), '0dp')
+                  # Keep the original textSize/color/maxLines; only center it.
+                  label.set(a('gravity'), 'center_vertical')
+              tree.write(path, encoding='utf-8', xml_declaration=True)
+              changed.append(path.name)
+
+          if not {'widget_row_survival.xml', 'widget_row_survival_silver_highlight.xml'}.issubset(set(changed)):
+              raise RuntimeError('Missing normal/silver Survival row layouts')
+          if len(changed) < 6:
+              raise RuntimeError(f'Not enough widget row variants updated: {changed}')
+
+          # The six rows need a readable minimum size. The visual layout
+          # expands/contracts above that limit, without shrinking font sizes.
+          info = base / 'xml' / 'last_plan_widget_info.xml'
+          if info.is_file():
+              info_tree = ET.parse(info)
+              root = info_tree.getroot()
+              root.set(a('minResizeHeight'), '245dp')
+              root.set(a('targetCellHeight'), '4')
+              info_tree.write(info, encoding='utf-8', xml_declaration=True)
+
+          print('Widget card fills host height; task row height is capped (no excessive gaps)')
+          print('Updated row variants: ' + ', '.join(changed))
+          PY
+
+      - name: Always render all six guild/Survival widget rows
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          # The Android renderer estimates how many lines fit and truncates its
+          # data to that count BEFORE applying the flexible 1/N row heights.
+          # On Samsung One UI this estimate can be four at a widget size that
+          # easily accommodates six. Keep at least six actual rows in the list.
+          root = Path('build-src/LAST_PLAN_Android/app/src/main')
+          candidates = list((root / 'java').rglob('LastPlanWidgetProvider.java'))
+          if len(candidates) != 1:
+              raise RuntimeError(f'Expected one widget provider Java file, found {len(candidates)}')
+          path = candidates[0]
+          src = path.read_text(encoding='utf-8')
+
+          marker = 'LASTPLAN_ALWAYS_RENDER_SIX_WIDGET_ROWS'
+          if marker in src:
+              print('Six-row widget render fix already included')
+          else:
+              # The source may order the two arguments either way. Target the
+              # unique Math.min involving a row-list .size() and the height cap.
+              # The APK's dex confirms the layout renderer makes this call.
+              patterns = [
+                  re.compile(r'Math\s*\.\s*min\s*\(\s*((?:[A-Za-z_$][\w$]*\.)?[A-Za-z_$][\w$]*\.size\(\))\s*,\s*([A-Za-z_$][\w$]*)\s*\)'),
+                  re.compile(r'Math\s*\.\s*min\s*\(\s*([A-Za-z_$][\w$]*)\s*,\s*((?:[A-Za-z_$][\w$]*\.)?[A-Za-z_$][\w$]*\.size\(\))\s*\)'),
+              ]
+              matches = []
+              for order, regex in enumerate(patterns):
+                  for match in regex.finditer(src):
+                      row_size, cap = (match.group(1), match.group(2)) if order == 0 else (match.group(2), match.group(1))
+                      matches.append((match.start(), match.end(), row_size, cap, match.group()))
+              # Do not change a random list in case the source evolves.
+              if len(matches) != 1:
+                  raise RuntimeError('Cannot safely identify unique row-count cap: ' + repr(matches[:8]))
+              start, end, row_size, cap, original = matches[0]
+              replacement = f'Math.min({row_size}, Math.max(6, {cap})) /* {marker} */'
+              src = src[:start] + replacement + src[end:]
+              path.write_text(src, encoding='utf-8')
+              print('Widget visible row cap:', original, '=>', replacement)
+              assert src.count(marker) == 1
+          PY
+
+      - name: Share six-slot widget spacing across tabs and show font-size controls
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import xml.etree.ElementTree as ET
+          
+          base = Path('build-src/LAST_PLAN_Android/app/src/main')
+          assets = base / 'assets' / 'index.html'
+          res = base / 'res'
+          java_candidates = list((base / 'java').rglob('LastPlanWidgetProvider.java'))
+          if len(java_candidates) != 1:
+              raise RuntimeError(f'Expected one LastPlanWidgetProvider.java, got {java_candidates}')
+          java = java_candidates[0]
+          marker = 'LASTPLAN_SIX_SLOT_SCALED_ROWS_V40'
+          source = java.read_text(encoding='utf-8')
+          if marker in source:
+              raise RuntimeError('This step should run exactly once on clean source')
+          
+          # Exactly six equal height slots, regardless of active tab's item count.
+          # Real content rows are distributed as in Survival; unused slots become
+          # transparent spacer rows, so a three-item Guild-war list does not balloon.
+          android_uri = '{http://schemas.android.com/apk/res/android}'
+          ET.register_namespace('android', 'http://schemas.android.com/apk/res/android')
+          def a(k): return android_uri+k
+          changed=[]
+          for path in sorted((res / 'layout').glob('widget_row_*.xml')):
+              t=ET.parse(path)
+              root=t.getroot()
+              if not root.tag.endswith('LinearLayout'): continue
+              bodies=[node for node in root if node.tag.endswith('LinearLayout')]
+              if len(bodies)!=1: continue
+              body=bodies[0]
+              labels=[node for node in body if node.get(a('id'),'').endswith(('/widget_row_time','/widget_row_title'))]
+              if len(labels)!=2: continue
+              root.set(a('layout_height'),'0dp')
+              root.set(a('layout_weight'),'1')
+              root.set(a('minHeight'),'0dp')
+              body.set(a('layout_height'),'0dp')
+              body.set(a('layout_weight'),'1')
+              body.set(a('minHeight'),'0dp')
+              body.set(a('paddingTop'),'0dp')
+              body.set(a('paddingBottom'),'0dp')
+              # Preserve original font sizes: the prior changes made text LOOK smaller
+              # by reducing every row's vertical space, not by changing the sp values.
+              for label in labels:
+                  label.set(a('layout_height'),'match_parent')
+                  label.set(a('minHeight'),'0dp')
+                  label.set(a('gravity'),'center_vertical')
+              t.write(path,encoding='utf-8',xml_declaration=True)
+              changed.append(path.name)
+          need = {'widget_row_survival.xml','widget_row_survival_silver_highlight.xml'}
+          if not need.issubset(set(changed)) or len(changed)<6:
+              raise RuntimeError(f'Missing widget row variants: {changed}')
+          
+          spacer=res/'layout'/'widget_row_balancer.xml'
+          spacer.write_text('''<?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="0dp"
+              android:layout_weight="1"
+              android:minHeight="0dp"
+              android:orientation="vertical"
+              android:background="@android:color/transparent" />
+          ''',encoding='utf-8')
+          
+          # The Java provider assembles Android RemoteViews for the widget. Count the
+          # rows that it actually adds and pad the same RemoteViews with blank 1/6 slots
+          # before Android is asked to update it. This shares exact spacing among tabs
+          # without altering text size or any item strings.
+          add_pat=re.compile(r'(?P<parent>\b[A-Za-z_$][\w$]*)\.addView\(\s*R\.id\.widget_rows\s*,\s*(?P<child>[A-Za-z_$][\w$]*)\s*\)')
+          add_found=add_pat.findall(source)
+          if not add_found:
+              raise RuntimeError('Could not locate widget_rows.addView call; native source shape changed')
+          source=add_pat.sub(lambda m: f'LastPlanRowBalancer.addContent({m.group("parent")}, {m.group("child")})',source)
+          
+          # Insert a row-padding action immediately before each widget update. This
+          # handles updates by integer ID, ID array, or ComponentName without depending
+          # on the widget-manager variable name or the first argument's syntax.
+          update_pat=re.compile(r'\bupdateAppWidget\s*\(')
+          updates=[]
+          for match in update_pat.finditer(source):
+              pos=match.end()-1
+              depth=0
+              commas=[]
+              quote=None
+              escaped=False
+              for j in range(pos,len(source)):
+                  ch=source[j]
+                  if quote:
+                      if escaped: escaped=False
+                      elif ch=='\\': escaped=True
+                      elif ch==quote: quote=None
+                      continue
+                  if ch in ('\"',"'"):
+                      quote=ch
+                  elif ch=='(':
+                      depth+=1
+                  elif ch==')':
+                      depth-=1
+                      if depth==0:
+                          break
+                  elif ch==',' and depth==1:
+                      commas.append(j)
+              else: raise RuntimeError('Unbalanced updateAppWidget(...) Java expression')
+              if len(commas)!=1:
+                  # Calls with an unsupported signature are left unchanged; require at
+                  # least one supported real widget-update site before enabling layout.
+                  continue
+              remote=source[commas[-1]+1:j].strip()
+              if not re.fullmatch(r'[A-Za-z_$][\w$]*',remote):
+                  continue
+              updates.append((match.start(),remote))
+          if not updates:
+              raise RuntimeError('Could not identify RemoteViews variable in widget updates')
+          # Position the padding before the complete statement, not inside a call.
+          for start,remote in sorted(updates,reverse=True):
+              line_start=source.rfind('\n',0,start)+1
+              prefix=source[line_start:start]
+              if not prefix.lstrip().strip().endswith('.') or ';' in prefix:
+                  raise RuntimeError('Unusual widget update call structure: '+prefix[-70:])
+              indent=re.match(r'[ \t]*',prefix).group(0)
+              source=source[:line_start]+f'{indent}LastPlanRowBalancer.pad({remote});\n'+source[line_start:]
+          update_found=[x[1] for x in updates]
+          
+          # Some provider paths reuse a RemoteViews during onAppWidgetOptionsChanged.
+          # Reset the count whenever a widget row container is cleared.
+          reset_pat=re.compile(r'(?P<parent>\b[A-Za-z_$][\w$]*)\.removeAllViews\(\s*R\.id\.widget_rows\s*\)')
+          reset_found=reset_pat.findall(source)
+          source=reset_pat.sub(lambda m: f'LastPlanRowBalancer.reset({m.group("parent")})', source)
+          
+          # Standalone helper uses fully qualified Java class names so it introduces
+          # no import conflicts in the preexisting provider.
+          helper='''
+            // LASTPLAN_SIX_SLOT_SCALED_ROWS_V40
+            // Six equal resizing slots for all three widget tabs; unused slots are blank.
+            private static final class LastPlanRowBalancer {
+              private static final java.util.Map<android.widget.RemoteViews, Integer> COUNTS =
+                  java.util.Collections.synchronizedMap(new java.util.WeakHashMap<android.widget.RemoteViews, Integer>());
+          
+              static void reset(android.widget.RemoteViews parent) {
+                parent.removeAllViews(R.id.widget_rows);
+                COUNTS.put(parent, 0);
+              }
+              static void addContent(android.widget.RemoteViews parent, android.widget.RemoteViews row) {
+                parent.addView(R.id.widget_rows, row);
+                Integer count=COUNTS.get(parent);
+                COUNTS.put(parent, (count==null ? 0 : count)+1);
+              }
+              static void pad(android.widget.RemoteViews parent) {
+                Integer count=COUNTS.get(parent);
+                if (count == null) return;  // Other unrelated RemoteViews are unchanged.
+                for (int i=count; i<6; i++) {
+                  parent.addView(R.id.widget_rows,
+                    new android.widget.RemoteViews("com.lastplan.app", R.layout.widget_row_balancer));
+                }
+                COUNTS.remove(parent);
+              }
+            }
+          '''
+          # Insert the helper just before the class's final closing brace, not into an inner block.
+          if not source.rstrip().endswith('}'):
+              raise RuntimeError('Unexpected Java class ending')
+          pos=source.rfind('}')
+          source=source[:pos]+helper+'\n'+source[pos:]
+          java.write_text(source,encoding='utf-8')
+          
+          # The app already offers four native-supported text-size choices in Widget
+          # Settings. Add visible +/- controls using the very same existing setting and
+          # native bridge; do NOT create a second persistence value or change default.
+          html=assets.read_text(encoding='utf-8')
+          if html.count('id="widgetFontChoice"')!=1:
+              raise RuntimeError('Expected existing widget font choice exactly once')
+          selpat=re.compile(r'<select\s+id="widgetFontChoice"[^>]*>[\s\S]*?</select>')
+          sel=selpat.search(html)
+          if sel is None: raise RuntimeError('Existing widget font-size dropdown unavailable')
+          plus='''
+                        <div id="lpWidgetFontStepper" class="lp-widget-font-stepper" role="group" aria-label="위젯 글씨 크기 조절">
+                          <button type="button" id="lpWidgetFontMinus" aria-label="위젯 글씨 작게">−</button>
+                          <strong id="lpWidgetFontCurrent" aria-live="polite">보통</strong>
+                          <button type="button" id="lpWidgetFontPlus" aria-label="위젯 글씨 크게">＋</button>
+                        </div>'''
+          html=html[:sel.end()]+plus+html[sel.end():]
+          css='''
+          <style id="lastplan-widget-font-stepper-v40">
+          #lpWidgetFontStepper{display:flex;align-items:center;justify-content:space-between;gap:9px;margin:8px 0 15px;max-width:100%;}
+          #lpWidgetFontStepper button{width:51px;min-height:43px;border:1px solid rgba(220,193,138,.6);border-radius:7px;background:#1A1D23;color:#EBD3A4;font-size:26px;cursor:pointer;}
+          #lpWidgetFontCurrent{flex:1;text-align:center;color:#F4F4F4;font-size:15px;font-weight:700;}
+          </style>
+          <script id="lastplan-widget-font-stepper-v40">
+          (function(){
+            function init(){
+              const select=document.getElementById('widgetFontChoice');
+              const minus=document.getElementById('lpWidgetFontMinus');
+              const plus=document.getElementById('lpWidgetFontPlus');
+              const current=document.getElementById('lpWidgetFontCurrent');
+              if(!select||!minus||!plus||!current)return;
+              const labels=['작게','보통 (기본값)','크게','아주 크게'];
+              function sync(){
+                const v=Math.max(0,Math.min(3,Number(select.value)||0));
+                current.textContent=labels[v];
+                minus.disabled=v===0;plus.disabled=v===3;
+                minus.style.opacity=v===0?'.4':'1';plus.style.opacity=v===3?'.4':'1';
+              }
+              function adjust(delta){
+                select.value=String(Math.max(0,Math.min(3,Number(select.value)+delta)));
+                select.dispatchEvent(new Event('change',{bubbles:true}));
+                sync();
+              }
+              minus.addEventListener('click',()=>adjust(-1));
+              plus.addEventListener('click',()=>adjust(1));
+              select.addEventListener('change',sync);
+              sync();
+              // Existing native bridge may populate this selector during page startup.
+              requestAnimationFrame(sync);
+            }
+            if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);
+            else init();
+          })();
+          </script>
+          '''
+          if '<body' not in html: raise RuntimeError('HTML body missing')
+          # This app has multiple legacy style blocks after </body>; placing before the
+          # original close-body keeps the new controls in the same WebView document.
+          if html.count('</body>')!=1: raise RuntimeError('Expected one HTML body close')
+          html=html.replace('</body>',css+'\n</body>',1)
+          assets.write_text(html,encoding='utf-8')
+          
+          print('V40 spacing: 6 equal growth slots across Today/Guild War/Survival; text sp unchanged')
+          print('Native addView patterns:',len(add_found),'updates:',len(update_found),'resets:',len(reset_found))
+          print('Updated row layouts:', ', '.join(changed))
+          print('Widget Settings: original 4 levels kept, +/- size controls added')
+          PY
+
+      - name: Recover existing online guild membership before rejoining
+        run: |
+          python3 - <<'PY'
+          """Safe online guild re-entry patch for LAST PLAN.
+          
+          The server-returned Firebase membership role remains the only source of authority.
+          Never derive permissions from these local hints.
+          """
+          from pathlib import Path
+          import sys
+          
+          path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('build-src/LAST_PLAN_Android/app/src/main/assets/index.html')
+          src = path.read_text(encoding='utf-8')
+          marker = 'LASTPLAN_RESUME_MEMBERSHIP_BEFORE_JOIN_V41'
+          if marker in src:
+              print('Safe online re-entry already patched')
+              raise SystemExit(0)
+          
+          anchor = '  function onlineGuildLogin(result, code){'
+          assert src.count(anchor) == 1, f'Expected one onlineGuildLogin, got {src.count(anchor)}'
+          helper = r'''  // LASTPLAN_RESUME_MEMBERSHIP_BEFORE_JOIN_V41
+            // This storage is ONLY a discovery hint. Server resumeGuild decides the role.
+            const LAST_PLAN_MEMBERSHIP_HINTS = 'lastPlanOnlineMembershipHintsV41';
+            function loadOnlineMembershipHints(){
+              try {
+                const value = JSON.parse(localStorage.getItem(LAST_PLAN_MEMBERSHIP_HINTS) || '{}');
+                return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+              } catch(_) { return {}; }
+            }
+            function rememberOnlineMembership(result, code){
+              if(!result?.guildId || !result?.uid || !result?.name) return;
+              const key = normalizeKey(result.name, code);
+              const hints = loadOnlineMembershipHints();
+              hints[key] = {guildId:result.guildId, uid:result.uid,
+                role:onlineRole(result.role), updatedAt:Date.now()};
+              try { localStorage.setItem(LAST_PLAN_MEMBERSHIP_HINTS, JSON.stringify(hints)); }catch(_){}
+            }
+            async function resumeOrJoinOnlineGuild(name, code){
+              const key = normalizeKey(name, code);
+              const uid = String(online?.uid || '');
+              if(!uid) throw new Error('Firebase 인증 ID가 없습니다. 인터넷 연결을 확인해주세요.');
+              const guild = loadGuilds()[key];
+              const hint = loadOnlineMembershipHints()[key];
+              const previous = guild?.online && guild.guildId ? guild : null;
+              const deviceMember = previous?.members?.[getDeviceId()];
+              const storedMember = localStorage.getItem('guildScheduleCurrentGuild') === key
+                ? getSavedSessionMember() : null;
+              const ownerUid = (hint?.uid || deviceMember?.memberId || storedMember?.memberId || '');
+              const knownGuildId = hint?.guildId || previous?.guildId;
+              if(knownGuildId && ownerUid === uid){
+                // Crucial: do NOT call joinGuild for an already enrolled administrator.
+                // Joining could turn the same UID into a regular member on some servers.
+                try { return await online.resumeGuild(knownGuildId); }
+                catch(e){
+                  const error = new Error('기존 길드 권한을 확인하지 못했습니다. 앱 데이터를 삭제하지 말고 기존 계정으로 다시 접속하세요.');
+                  error.code = 'MEMBERSHIP_RESUME_FAILED';
+                  throw error;
+                }
+              }
+              const previouslyPrivileged = hint?.role === '길드장' || hint?.role === '관리자'
+                || deviceMember?.role === '길드장' || deviceMember?.role === '관리자';
+              if(knownGuildId && ownerUid && ownerUid !== uid && previouslyPrivileged){
+                const error = new Error('현재 Firebase 사용자 ID가 기존 관리자 계정과 다릅니다. 비밀번호만으로 권한을 복원할 수 없으므로 앱 데이터를 삭제하지 말고 운영자에게 계정 복구를 요청하세요.');
+                error.code = 'MEMBERSHIP_UID_CHANGED';
+                throw error;
+              }
+              // First-time member joins remain unchanged and receive server-defined roles.
+              return await online.joinGuild(name, code, '길드원');
+            }
+          '''
+          src = src.replace(anchor, helper + anchor, 1)
+          record_anchor = "    const member={memberId:result.uid,nickname:result.nickname||'길드원',\n      role:onlineRole(result.role),joinedAt:new Date().toISOString()};"
+          assert src.count(record_anchor) == 1, f'Expected one online member record, got {src.count(record_anchor)}'
+          src = src.replace(record_anchor, record_anchor + '\n    rememberOnlineMembership(result, code);', 1)
+          old_login = ".then(()=>online.joinGuild(name,code,'길드원'))"
+          assert src.count(old_login) == 1, f'Expected one online join path, got {src.count(old_login)}'
+          src = src.replace(old_login, '.then(()=>resumeOrJoinOnlineGuild(name,code))', 1)
+          err_anchor = "            if(/guild_not_found|not.found|guild.*missing/i.test(code)){"
+          assert src.count(err_anchor) == 1
+          src = src.replace(err_anchor, "            if(/MEMBERSHIP_RESUME_FAILED|MEMBERSHIP_UID_CHANGED/.test(code)){\n              showAppDialog(error.message,'관리자 계정 확인');\n            }else if(/guild_not_found|not.found|guild.*missing/i.test(code)){", 1)
+          assert src.count(marker) == 1
+          path.write_text(src, encoding='utf-8')
+          print('Patched LAST PLAN online relogin: resume existing UID first; no client-side privilege escalation.')
+          PY
+
+      - name: Enable safe online guild-name change only
+        run: |
+          python3 - <<'PY'
+          """LAST PLAN: only enable safe online guild-name rename (V42)."""
+          from pathlib import Path
+          import textwrap
+
+          BASE = Path('build-src/LAST_PLAN_Android')
+          JAVA = BASE / 'app/src/main/java/com/lastplan/app/LastPlanBridge.java'
+          HTML = BASE / 'app/src/main/assets/index.html'
+          JS = BASE / 'app/src/main/assets/firebase-sync.js'
+          RULES = BASE / 'firestore.rules'
+          MARKER = 'LASTPLAN_GUILD_RENAME_V42'
+
+
+          def replace_one(source, old, new, label):
+              n = source.count(old)
+              if n != 1:
+                  raise RuntimeError(f'{label}: expected one match; found {n}')
+              return source.replace(old, new, 1)
+
+
+          def patch_bridge(s):
+              if MARKER in s:
+                  raise RuntimeError('Guild rename bridge step already applied')
+              s = replace_one(s,
+                  '                    case "resumeGuild": completeMembership(requestId, docId(required(payload, "guildId", 120))); return;',
+                  '                    case "resumeGuild": completeMembership(requestId, docId(required(payload, "guildId", 120))); return;\n'
+                  '                    case "renameGuild": renameGuild(requestId, payload); return;',
+                  'Java rename call')
+
+              method = textwrap.dedent('''
+                  /** LASTPLAN_GUILD_RENAME_V42: atomic rename keeps the original guild ID and all subcollections. */
+                  private void renameGuild(String req, JSONObject p) throws Exception {
+                      String gid = docId(required(p, "guildId", 120));
+                      String newName = required(p, "name", 30);
+                      String joinCode = required(p, "code", 64);
+                      String uid = signedIn().getUid();
+                      DocumentReference guild = db.collection("guilds").document(gid);
+                      DocumentReference myself = guild.collection("members").document(uid);
+                      String now = nowIso();
+                      db.runTransaction(tx -> {
+                          // Firestore transactions must read all documents before writing.
+                          DocumentSnapshot oldGuild = tx.get(guild);
+                          DocumentSnapshot myMember = tx.get(myself);
+                          if (!oldGuild.exists() || !myMember.exists()
+                                  || !uid.equals(oldGuild.getString("ownerUid"))
+                                  || !"leader".equals(myMember.getString("role"))) {
+                              throw new IllegalStateException("only_guild_leader_can_rename");
+                          }
+                          String oldName = safe(oldGuild.getString("name"));
+                          String currentHash = safe(oldGuild.getString("joinCodeHash"));
+                          if (newName.equals(oldName)) throw new IllegalArgumentException("guild_name_unchanged");
+                          if (!currentHash.equals(hashJoin(oldName, joinCode))
+                                  && !currentHash.equals(legacyHashJoin(oldName, joinCode))) {
+                              throw new IllegalArgumentException("guild_code_mismatch");
+                          }
+                          String newHash = hashJoin(newName, joinCode);
+                          if (newHash.equals(currentHash)) throw new IllegalArgumentException("guild_name_hash_unchanged");
+                          DocumentReference oldDirectory = db.collection("guildDirectory").document(currentHash);
+                          DocumentReference newDirectory = db.collection("guildDirectory").document(newHash);
+                          DocumentSnapshot oldEntry = tx.get(oldDirectory);
+                          DocumentSnapshot existing = tx.get(newDirectory);
+                          if (!oldEntry.exists() || !gid.equals(oldEntry.getString("guildId"))
+                                  || !uid.equals(oldEntry.getString("ownerUid"))) {
+                              throw new IllegalStateException("guild_directory_mismatch");
+                          }
+                          if (existing.exists()) throw new IllegalStateException("guild_already_exists");
+
+                          // All three mutations must commit together, or none will.
+                          Map<String, Object> newEntry = new HashMap<>();
+                          newEntry.put("guildId", gid);
+                          newEntry.put("ownerUid", uid);
+                          newEntry.put("createdAt", now);
+                          tx.set(newDirectory, newEntry);
+                          tx.update(guild, "name", newName, "joinCodeHash", newHash, "updatedAt", now);
+                          tx.delete(oldDirectory);
+                          return gid;
+                      }).addOnSuccessListener(saved -> completeMembership(req, gid))
+                        .addOnFailureListener(e -> failure(req, e));
+                  }
+
+              ''').replace('    private void renameGuild', '    private void renameGuild', 1)
+              # Match the four-space class indentation of the original Java file.
+              method = textwrap.indent(method, '    ')
+              s = replace_one(s, '    private void joinGuild(String req, JSONObject p) throws Exception {',
+                              method + '    private void joinGuild(String req, JSONObject p) throws Exception {',
+                              'Java rename implementation')
+
+              anchor = '        String uid = signedIn().getUid();\n        listeners.add(db.collection("guilds").document(gid).collection("members").document(uid)'
+              insertion = '''        String uid = signedIn().getUid();
+                  // Keep every already-connected member's display name in sync with the server.
+                  listeners.add(db.collection("guilds").document(gid)
+                      .addSnapshotListener((doc, e) -> {
+                          if (e != null) { emitError(gid, "guildMeta", e); return; }
+                          JSONArray items = new JSONArray();
+                          if (doc != null && doc.exists()) {
+                              JSONObject meta = new JSONObject();
+                              try { meta.put("name", safe(doc.getString("name"))); }
+                              catch (Exception ignored) {}
+                              items.put(meta);
+                          }
+                          emitSnapshot(gid, "guildMeta", items);
+                      }));
+                  listeners.add(db.collection("guilds").document(gid).collection("members").document(uid)'''
+              s = replace_one(s, anchor, insertion, 'Java guild metadata watcher')
+              return s
+
+
+          def patch_js(s):
+              anchor = '    resumeGuild: guildId => call(\'resumeGuild\', {guildId}),' 
+              new = anchor + "\n    renameGuild: (guildId, name, code) => call('renameGuild', {guildId, name, code}),"
+              return replace_one(s, anchor, new, 'Firebase transport rename method')
+
+
+          def patch_html(s):
+              if MARKER in s:
+                  raise RuntimeError('Guild rename UI step already applied')
+              helper = '''  // LASTPLAN_GUILD_RENAME_V42: update only this guild's local display/cache after a committed server rename.
+            function applyCommittedOnlineGuildName(gid, nextName){
+              const ctx=getCurrentGuildAndMember();
+              if(!ctx.guild?.online || ctx.guild.guildId!==gid) return;
+              const name=String(nextName||'').trim();
+              if(!name || name===ctx.guild.guildName) return;
+              const oldKey=ctx.key;
+              const newKey=normalizeKey(name,ctx.guild.guildCode);
+              const all=ctx.guilds;
+              const colliding=all[newKey];
+              if(colliding && colliding.guildId!==gid){
+                showAppDialog('새 길드명으로 저장된 다른 길드 정보가 있어 자동 갱신하지 못했습니다.','길드 정보 갱신');
+                return;
+              }
+              const updated={...ctx.guild,guildName:name};
+              delete all[oldKey];
+              all[newKey]=updated;
+              saveGuilds(all);
+              if(oldKey!==newKey) migratePersonalKeyPrefix(oldKey,newKey);
+              saveSession(newKey,ctx.member);
+              const hints=loadOnlineMembershipHints();
+              if(hints[oldKey]){
+                hints[newKey]={...hints[oldKey],updatedAt:Date.now()};
+                if(oldKey!==newKey) delete hints[oldKey];
+                localStorage.setItem(LAST_PLAN_MEMBERSHIP_HINTS,JSON.stringify(hints));
+              }
+              homeGuildName.textContent=name;
+              memberGuildName.textContent=name;
+              if(typeof window.updateGuildName==='function') window.updateGuildName(name);
+              syncWidgetNow(true);
+            }
+
+          '''
+              s = replace_one(s, '  function changeGuildIdentity(newName,newCode){',
+                              helper+'  function changeGuildIdentity(newName,newCode){',
+                              'online renamed guild cache helper')
+
+              old = '''  function renderAdminRename(){
+              openAdminFeature('길드명 변경'); const ctx=currentAdminContext();
+              if(!isCurrentLeader()){ adminFeatureBody.innerHTML='<div class="admin-empty-state">길드명 변경은 길드장만 할 수 있습니다.</div>'; return; }
+              adminFeatureBody.innerHTML=`<div class="admin-form"><label>새 길드명<input id="adminRenameInput" maxlength="30" value="${adminEscape(ctx.guild.guildName)}"></label><div class="admin-action-bar"><button id="adminRenameSave" class="admin-primary-btn" type="button">변경</button></div></div>`;
+              document.getElementById('adminRenameSave').onclick=()=>{const v=document.getElementById('adminRenameInput').value.trim(); if(!v){showAppDialog('길드명을 입력해주세요.','길드명 변경');return;} if(changeGuildIdentity(v,null)){addAdminLog('길드명 변경');showSettingsToast('길드명이 변경되었습니다.');renderAdminRename();}};
+            }
+          '''
+              new = '''  function renderAdminRename(){
+              openAdminFeature('길드명 변경'); const ctx=currentAdminContext();
+              if(!isCurrentLeader()){ adminFeatureBody.innerHTML='<div class="admin-empty-state">길드명 변경은 길드장만 할 수 있습니다.</div>'; return; }
+              adminFeatureBody.innerHTML=`<div class="admin-form"><label>새 길드명<input id="adminRenameInput" maxlength="30" value="${adminEscape(ctx.guild.guildName)}"></label><div class="admin-action-bar"><button id="adminRenameSave" class="admin-primary-btn" type="button">변경</button></div></div>`;
+              document.getElementById('adminRenameSave').onclick=async()=>{
+                const field=document.getElementById('adminRenameInput');
+                const button=document.getElementById('adminRenameSave');
+                const v=field.value.trim();
+                if(!v){showAppDialog('길드명을 입력해주세요.','길드명 변경');return;}
+                if(v===ctx.guild.guildName){showSettingsToast('현재 길드명과 같습니다.');return;}
+                if(isOnlineSession()){
+                  const code=String(ctx.guild.guildCode||'').trim();
+                  if(!code){showAppDialog('기존 길드코드를 확인할 수 없습니다. 기존 길드에 재로그인한 뒤 다시 시도해주세요.','길드명 변경');return;}
+                  button.disabled=true;
+                  try{
+                    await awaitNativeAuthentication();
+                    if(typeof online?.renameGuild!=='function') throw new Error('앱 업데이트가 필요합니다.');
+                    const result=await online.renameGuild(ctx.guild.guildId,v,code);
+                    applyCommittedOnlineGuildName(result.guildId,result.name);
+                    addAdminLog('길드명 변경');
+                    showSettingsToast('길드명이 변경되었습니다.');
+                    renderAdminRename();
+                  }catch(error){
+                    const details=String(error?.message||error||'');
+                    showAppDialog('길드명 변경이 서버에 저장되지 않았습니다. 기존 길드명은 유지됩니다.\\n'+details,'길드명 변경 실패');
+                  }finally{button.disabled=false;}
+                  return;
+                }
+                if(changeGuildIdentity(v,null)){
+                  addAdminLog('길드명 변경');showSettingsToast('길드명이 변경되었습니다.');renderAdminRename();
+                }
+              };
+            }
+          '''
+              s=replace_one(s,old,new,'only administrator rename screen')
+
+              anchor="    const rows=Array.isArray(detail.items)?detail.items:[];\n    if(detail.kind==='myRole'){"
+              replacement="""    const rows=Array.isArray(detail.items)?detail.items:[];
+              if(detail.kind==='guildMeta'){
+                if(rows[0]?.name) applyCommittedOnlineGuildName(detail.guildId,rows[0].name);
+                return;
+              }
+              if(detail.kind==='myRole'){"""
+              s=replace_one(s,anchor,replacement,'online guild name refresh event')
+
+              # A guild member who reconnects with an old local name will receive the
+              # canonical latest server name through resumeGuild. Discard stale keys.
+              anchor='''  function onlineGuildLogin(result, code){
+              const key=normalizeKey(result.name,code);
+              const deviceId=getDeviceId();'''
+              replacement='''  function onlineGuildLogin(result, code){
+              const key=normalizeKey(result.name,code);
+              // Renamed guilds keep their ID; move any old login-cache key on resume.
+              const guildsBefore=loadGuilds();
+              for(const [oldKey, oldGuild] of Object.entries(guildsBefore)){
+                if(oldKey===key || !oldGuild?.online || oldGuild.guildId!==result.guildId) continue;
+                if(guildsBefore[key]?.guildId && guildsBefore[key].guildId!==result.guildId) continue;
+                if(!guildsBefore[key]) guildsBefore[key]={...oldGuild,guildName:result.name,guildCode:code};
+                delete guildsBefore[oldKey];
+                migratePersonalKeyPrefix(oldKey,key);
+                const hints=loadOnlineMembershipHints();
+                if(hints[oldKey] && !hints[key]) hints[key]=hints[oldKey];
+                if(hints[oldKey]) delete hints[oldKey];
+                localStorage.setItem(LAST_PLAN_MEMBERSHIP_HINTS,JSON.stringify(hints));
+              }
+              saveGuilds(guildsBefore);
+              const deviceId=getDeviceId();'''
+              s=replace_one(s,anchor,replacement,'relogin renamed guild migration')
+              return s
+
+
+          def patch_rules(s):
+              if MARKER in s:
+                  raise RuntimeError('Guild rename rules already applied')
+              start=s.index('    match /guildDirectory/{joinHash} {')
+              stop=s.index('    match /guilds/{gid} {', start)
+              directory=textwrap.dedent('''
+                  // LASTPLAN_GUILD_RENAME_V42: directory rotate is atomic with guild rename.
+                  match /guildDirectory/{joinHash} {
+                    allow get: if signedIn();
+                    allow list: if false;
+                    // Keep original guild creation unchanged; also permit an existing
+                    // leader to create the replacement directory in an atomic rename.
+                    allow create: if (
+                      signedIn() && validJoinHash(joinHash)
+                      && request.resource.data.keys().hasOnly(['guildId', 'ownerUid', 'createdAt'])
+                      && request.resource.data.ownerUid == request.auth.uid
+                      && getAfter(guildPath(request.resource.data.guildId)).data.ownerUid == request.auth.uid
+                      && getAfter(guildPath(request.resource.data.guildId)).data.joinCodeHash == joinHash
+                      && getAfter(memberPath(request.resource.data.guildId, request.auth.uid)).data.role == 'leader'
+                    ) || (
+                      signedIn() && validJoinHash(joinHash)
+                      && request.resource.data.keys().hasOnly(['guildId', 'ownerUid', 'createdAt'])
+                      && request.resource.data.keys().hasAll(['guildId', 'ownerUid', 'createdAt'])
+                      && request.resource.data.ownerUid == request.auth.uid
+                      && exists(guildPath(request.resource.data.guildId))
+                      && leader(request.resource.data.guildId)
+                      && get(guildPath(request.resource.data.guildId)).data.ownerUid == request.auth.uid
+                      && getAfter(guildPath(request.resource.data.guildId)).data.ownerUid == request.auth.uid
+                      && getAfter(guildPath(request.resource.data.guildId)).data.name != get(guildPath(request.resource.data.guildId)).data.name
+                      && getAfter(guildPath(request.resource.data.guildId)).data.joinCodeHash == joinHash
+                      && !existsAfter(directoryPath(get(guildPath(request.resource.data.guildId)).data.joinCodeHash))
+                    );
+                    allow update: if false;
+                    // Old directory can only disappear when this leader atomically
+                    // commits a new name, a new matching directory, and a new hash.
+                    allow delete: if signedIn()
+                      && validJoinHash(joinHash)
+                      && resource.data.ownerUid == request.auth.uid
+                      && exists(guildPath(resource.data.guildId))
+                      && leader(resource.data.guildId)
+                      && get(guildPath(resource.data.guildId)).data.ownerUid == request.auth.uid
+                      && get(guildPath(resource.data.guildId)).data.joinCodeHash == joinHash
+                      && getAfter(guildPath(resource.data.guildId)).data.ownerUid == request.auth.uid
+                      && getAfter(guildPath(resource.data.guildId)).data.name != get(guildPath(resource.data.guildId)).data.name
+                      && getAfter(guildPath(resource.data.guildId)).data.joinCodeHash != joinHash
+                      && existsAfter(directoryPath(getAfter(guildPath(resource.data.guildId)).data.joinCodeHash))
+                      && getAfter(directoryPath(getAfter(guildPath(resource.data.guildId)).data.joinCodeHash)).data.guildId == resource.data.guildId
+                      && getAfter(directoryPath(getAfter(guildPath(resource.data.guildId)).data.joinCodeHash)).data.ownerUid == request.auth.uid;
+                  }
+
+              ''').strip('\n')
+              directory=textwrap.indent(directory,'    ')+'\n\n'
+              s=s[:start]+directory+s[stop:]
+
+              original='''      // A rename, invite-code change, ownership transfer, and deletion require
+                // dedicated atomic workflows that also update directory and roles.
+                allow update, delete: if false;'''
+              updated='''      // Guild leaders may change the guild NAME ONLY. The directory is
+                // rotated atomically, while owner, guild ID and all subcollections remain.
+                allow update: if signedIn()
+                  && leader(gid)
+                  && resource.data.ownerUid == request.auth.uid
+                  && request.resource.data.ownerUid == resource.data.ownerUid
+                  && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','joinCodeHash','updatedAt'])
+                  && request.resource.data.diff(resource.data).affectedKeys().hasAll(['name','joinCodeHash'])
+                  && request.resource.data.name is string
+                  && request.resource.data.name.size() > 0
+                  && request.resource.data.name.size() <= 30
+                  && request.resource.data.name != resource.data.name
+                  && validJoinHash(request.resource.data.joinCodeHash)
+                  && request.resource.data.joinCodeHash != resource.data.joinCodeHash
+                  && exists(directoryPath(resource.data.joinCodeHash))
+                  && get(directoryPath(resource.data.joinCodeHash)).data.guildId == gid
+                  && get(directoryPath(resource.data.joinCodeHash)).data.ownerUid == request.auth.uid
+                  && !existsAfter(directoryPath(resource.data.joinCodeHash))
+                  && existsAfter(directoryPath(request.resource.data.joinCodeHash))
+                  && getAfter(directoryPath(request.resource.data.joinCodeHash)).data.guildId == gid
+                  && getAfter(directoryPath(request.resource.data.joinCodeHash)).data.ownerUid == request.auth.uid;
+                // Guild code changes, ownership transfers, and deletion remain blocked.
+                allow delete: if false;'''
+              s=replace_one(s,original,updated,'FireStore only guild name update')
+              return s
+
+
+          def main():
+              for path in [JAVA, HTML, JS, RULES]:
+                  if not path.exists():
+                      raise FileNotFoundError(path)
+              new_bridge=patch_bridge(JAVA.read_text(encoding='utf-8'))
+              new_html=patch_html(HTML.read_text(encoding='utf-8'))
+              new_js=patch_js(JS.read_text(encoding='utf-8'))
+              new_rules=patch_rules(RULES.read_text(encoding='utf-8'))
+              # Each file is parsed/replaced in memory first; only after all checks
+              # succeed are any changes written to the build directory.
+              for path, data in [(JAVA,new_bridge),(HTML,new_html),(JS,new_js),(RULES,new_rules)]:
+                  path.write_text(data,encoding='utf-8')
+              print('Guild name rename: native transaction, Firestore authorization, live sync and UI installed')
+
+          if __name__ == '__main__':
+              main()
+          PY
+          node --check build-src/LAST_PLAN_Android/app/src/main/assets/firebase-sync.js
+
+      - name: Collect guild identity source for server-safe rename implementation
+        run: |
+          set -euo pipefail
+          SOURCE="build-src/LAST_PLAN_Android"
+          mkdir -p guild-identity-source
+          BRIDGE=$(find "$SOURCE/app/src/main/java" -type f -name 'LastPlanBridge.java' -print -quit)
+          test -n "$BRIDGE" || (echo "LastPlanBridge.java missing" && exit 1)
+          cp "$BRIDGE" guild-identity-source/LastPlanBridge.java
+          RULES=$(find "$SOURCE" -type f -name 'firestore.rules' -print -quit)
+          if [ -n "$RULES" ]; then cp "$RULES" guild-identity-source/firestore.rules; fi
+          echo "Native bridge captured for verifying guild rename access checks; no keys or secrets included."
+
+      - name: Upload guild identity source for later native rename fix
+        uses: actions/upload-artifact@v4
+        with:
+          name: LASTPLAN-GUILD-IDENTITY-SOURCE
+          path: guild-identity-source/
+          if-no-files-found: error
+
+      - name: Restore signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$KEYSTORE_BASE64" || (echo "Missing ANDROID_KEYSTORE_BASE64 secret" && exit 1)
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/LAST_PLAN_release.jks"
+
+      - name: Build release APK
+        working-directory: build-src/LAST_PLAN_Android
+        run: gradle :app:assembleRelease --no-daemon
+
+      - name: Sign APK with fixed key
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          test -n "$KEYSTORE_PASSWORD" || (echo "Missing ANDROID_KEYSTORE_PASSWORD secret" && exit 1)
+          mkdir -p dist
+          UNSIGNED="build-src/LAST_PLAN_Android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          ALIGNED="$RUNNER_TEMP/LAST-PLAN-aligned.apk"
+          ZIPALIGN="$ANDROID_SDK_ROOT/build-tools/35.0.0/zipalign"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner"
+
+          "$ZIPALIGN" -f -p 4 "$UNSIGNED" "$ALIGNED"
+
+          "$APKSIGNER" sign \
+            --ks "$RUNNER_TEMP/LAST_PLAN_release.jks" \
+            --ks-key-alias lastplan \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --key-pass "pass:$KEYSTORE_PASSWORD" \
+            --out dist/LAST-PLAN.apk \
+            "$ALIGNED"
+
+          "$APKSIGNER" verify --verbose --print-certs dist/LAST-PLAN.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LAST-PLAN-APK
+          path: dist/LAST-PLAN.apk
+          if-no-files-found: error
