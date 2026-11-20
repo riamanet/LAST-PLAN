@@ -2,6 +2,12 @@ name: Build LAST PLAN APK
 
 on:
   workflow_dispatch:
+    inputs:
+      deploy_guild_rename_rules:
+        description: '길드명 변경 Firebase 규칙을 검증한 뒤 게시 (기본 꺼짐)'
+        required: true
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -921,6 +927,342 @@ jobs:
           print('Patched LAST PLAN online relogin: resume existing UID first; no client-side privilege escalation.')
           PY
 
+      - name: Enable safe online guild-name change only
+        run: |
+          python3 - <<'PY'
+          """LAST PLAN: only enable safe online guild-name rename (V42)."""
+          from pathlib import Path
+          import textwrap
+
+          BASE = Path('build-src/LAST_PLAN_Android')
+          JAVA = BASE / 'app/src/main/java/com/lastplan/app/LastPlanBridge.java'
+          HTML = BASE / 'app/src/main/assets/index.html'
+          JS = BASE / 'app/src/main/assets/firebase-sync.js'
+          RULES = BASE / 'firestore.rules'
+          MARKER = 'LASTPLAN_GUILD_RENAME_V42'
+
+
+          def replace_one(source, old, new, label):
+              n = source.count(old)
+              if n != 1:
+                  raise RuntimeError(f'{label}: expected one match; found {n}')
+              return source.replace(old, new, 1)
+
+
+          def patch_bridge(s):
+              if MARKER in s:
+                  raise RuntimeError('Guild rename bridge step already applied')
+              s = replace_one(s,
+                  '                    case "resumeGuild": completeMembership(requestId, docId(required(payload, "guildId", 120))); return;',
+                  '                    case "resumeGuild": completeMembership(requestId, docId(required(payload, "guildId", 120))); return;\n'
+                  '                    case "renameGuild": renameGuild(requestId, payload); return;',
+                  'Java rename call')
+
+              method = textwrap.dedent('''
+                  /** LASTPLAN_GUILD_RENAME_V42: atomic rename keeps the original guild ID and all subcollections. */
+                  private void renameGuild(String req, JSONObject p) throws Exception {
+                      String gid = docId(required(p, "guildId", 120));
+                      String newName = required(p, "name", 30);
+                      String joinCode = required(p, "code", 64);
+                      String uid = signedIn().getUid();
+                      DocumentReference guild = db.collection("guilds").document(gid);
+                      DocumentReference myself = guild.collection("members").document(uid);
+                      String now = nowIso();
+                      db.runTransaction(tx -> {
+                          // Firestore transactions must read all documents before writing.
+                          DocumentSnapshot oldGuild = tx.get(guild);
+                          DocumentSnapshot myMember = tx.get(myself);
+                          if (!oldGuild.exists() || !myMember.exists()
+                                  || !uid.equals(oldGuild.getString("ownerUid"))
+                                  || !"leader".equals(myMember.getString("role"))) {
+                              throw new IllegalStateException("only_guild_leader_can_rename");
+                          }
+                          String oldName = safe(oldGuild.getString("name"));
+                          String currentHash = safe(oldGuild.getString("joinCodeHash"));
+                          if (newName.equals(oldName)) throw new IllegalArgumentException("guild_name_unchanged");
+                          if (!currentHash.equals(hashJoin(oldName, joinCode))
+                                  && !currentHash.equals(legacyHashJoin(oldName, joinCode))) {
+                              throw new IllegalArgumentException("guild_code_mismatch");
+                          }
+                          String newHash = hashJoin(newName, joinCode);
+                          if (newHash.equals(currentHash)) throw new IllegalArgumentException("guild_name_hash_unchanged");
+                          DocumentReference oldDirectory = db.collection("guildDirectory").document(currentHash);
+                          DocumentReference newDirectory = db.collection("guildDirectory").document(newHash);
+                          DocumentSnapshot oldEntry = tx.get(oldDirectory);
+                          DocumentSnapshot existing = tx.get(newDirectory);
+                          if (!oldEntry.exists() || !gid.equals(oldEntry.getString("guildId"))
+                                  || !uid.equals(oldEntry.getString("ownerUid"))) {
+                              throw new IllegalStateException("guild_directory_mismatch");
+                          }
+                          if (existing.exists()) throw new IllegalStateException("guild_already_exists");
+
+                          // All three mutations must commit together, or none will.
+                          Map<String, Object> newEntry = new HashMap<>();
+                          newEntry.put("guildId", gid);
+                          newEntry.put("ownerUid", uid);
+                          newEntry.put("createdAt", now);
+                          tx.set(newDirectory, newEntry);
+                          tx.update(guild, "name", newName, "joinCodeHash", newHash, "updatedAt", now);
+                          tx.delete(oldDirectory);
+                          return gid;
+                      }).addOnSuccessListener(saved -> completeMembership(req, gid))
+                        .addOnFailureListener(e -> failure(req, e));
+                  }
+
+              ''').replace('    private void renameGuild', '    private void renameGuild', 1)
+              # Match the four-space class indentation of the original Java file.
+              method = textwrap.indent(method, '    ')
+              s = replace_one(s, '    private void joinGuild(String req, JSONObject p) throws Exception {',
+                              method + '    private void joinGuild(String req, JSONObject p) throws Exception {',
+                              'Java rename implementation')
+
+              anchor = '        String uid = signedIn().getUid();\n        listeners.add(db.collection("guilds").document(gid).collection("members").document(uid)'
+              insertion = '''        String uid = signedIn().getUid();
+                  // Keep every already-connected member's display name in sync with the server.
+                  listeners.add(db.collection("guilds").document(gid)
+                      .addSnapshotListener((doc, e) -> {
+                          if (e != null) { emitError(gid, "guildMeta", e); return; }
+                          JSONArray items = new JSONArray();
+                          if (doc != null && doc.exists()) {
+                              JSONObject meta = new JSONObject();
+                              try { meta.put("name", safe(doc.getString("name"))); }
+                              catch (Exception ignored) {}
+                              items.put(meta);
+                          }
+                          emitSnapshot(gid, "guildMeta", items);
+                      }));
+                  listeners.add(db.collection("guilds").document(gid).collection("members").document(uid)'''
+              s = replace_one(s, anchor, insertion, 'Java guild metadata watcher')
+              return s
+
+
+          def patch_js(s):
+              anchor = '    resumeGuild: guildId => call(\'resumeGuild\', {guildId}),' 
+              new = anchor + "\n    renameGuild: (guildId, name, code) => call('renameGuild', {guildId, name, code}),"
+              return replace_one(s, anchor, new, 'Firebase transport rename method')
+
+
+          def patch_html(s):
+              if MARKER in s:
+                  raise RuntimeError('Guild rename UI step already applied')
+              helper = '''  // LASTPLAN_GUILD_RENAME_V42: update only this guild's local display/cache after a committed server rename.
+            function applyCommittedOnlineGuildName(gid, nextName){
+              const ctx=getCurrentGuildAndMember();
+              if(!ctx.guild?.online || ctx.guild.guildId!==gid) return;
+              const name=String(nextName||'').trim();
+              if(!name || name===ctx.guild.guildName) return;
+              const oldKey=ctx.key;
+              const newKey=normalizeKey(name,ctx.guild.guildCode);
+              const all=ctx.guilds;
+              const colliding=all[newKey];
+              if(colliding && colliding.guildId!==gid){
+                showAppDialog('새 길드명으로 저장된 다른 길드 정보가 있어 자동 갱신하지 못했습니다.','길드 정보 갱신');
+                return;
+              }
+              const updated={...ctx.guild,guildName:name};
+              delete all[oldKey];
+              all[newKey]=updated;
+              saveGuilds(all);
+              if(oldKey!==newKey) migratePersonalKeyPrefix(oldKey,newKey);
+              saveSession(newKey,ctx.member);
+              const hints=loadOnlineMembershipHints();
+              if(hints[oldKey]){
+                hints[newKey]={...hints[oldKey],updatedAt:Date.now()};
+                if(oldKey!==newKey) delete hints[oldKey];
+                localStorage.setItem(LAST_PLAN_MEMBERSHIP_HINTS,JSON.stringify(hints));
+              }
+              homeGuildName.textContent=name;
+              memberGuildName.textContent=name;
+              if(typeof window.updateGuildName==='function') window.updateGuildName(name);
+              syncWidgetNow(true);
+            }
+
+          '''
+              s = replace_one(s, '  function changeGuildIdentity(newName,newCode){',
+                              helper+'  function changeGuildIdentity(newName,newCode){',
+                              'online renamed guild cache helper')
+
+              old = '''  function renderAdminRename(){
+              openAdminFeature('길드명 변경'); const ctx=currentAdminContext();
+              if(!isCurrentLeader()){ adminFeatureBody.innerHTML='<div class="admin-empty-state">길드명 변경은 길드장만 할 수 있습니다.</div>'; return; }
+              adminFeatureBody.innerHTML=`<div class="admin-form"><label>새 길드명<input id="adminRenameInput" maxlength="30" value="${adminEscape(ctx.guild.guildName)}"></label><div class="admin-action-bar"><button id="adminRenameSave" class="admin-primary-btn" type="button">변경</button></div></div>`;
+              document.getElementById('adminRenameSave').onclick=()=>{const v=document.getElementById('adminRenameInput').value.trim(); if(!v){showAppDialog('길드명을 입력해주세요.','길드명 변경');return;} if(changeGuildIdentity(v,null)){addAdminLog('길드명 변경');showSettingsToast('길드명이 변경되었습니다.');renderAdminRename();}};
+            }
+          '''
+              new = '''  function renderAdminRename(){
+              openAdminFeature('길드명 변경'); const ctx=currentAdminContext();
+              if(!isCurrentLeader()){ adminFeatureBody.innerHTML='<div class="admin-empty-state">길드명 변경은 길드장만 할 수 있습니다.</div>'; return; }
+              adminFeatureBody.innerHTML=`<div class="admin-form"><label>새 길드명<input id="adminRenameInput" maxlength="30" value="${adminEscape(ctx.guild.guildName)}"></label><div class="admin-action-bar"><button id="adminRenameSave" class="admin-primary-btn" type="button">변경</button></div></div>`;
+              document.getElementById('adminRenameSave').onclick=async()=>{
+                const field=document.getElementById('adminRenameInput');
+                const button=document.getElementById('adminRenameSave');
+                const v=field.value.trim();
+                if(!v){showAppDialog('길드명을 입력해주세요.','길드명 변경');return;}
+                if(v===ctx.guild.guildName){showSettingsToast('현재 길드명과 같습니다.');return;}
+                if(isOnlineSession()){
+                  const code=String(ctx.guild.guildCode||'').trim();
+                  if(!code){showAppDialog('기존 길드코드를 확인할 수 없습니다. 기존 길드에 재로그인한 뒤 다시 시도해주세요.','길드명 변경');return;}
+                  button.disabled=true;
+                  try{
+                    await awaitNativeAuthentication();
+                    if(typeof online?.renameGuild!=='function') throw new Error('앱 업데이트가 필요합니다.');
+                    const result=await online.renameGuild(ctx.guild.guildId,v,code);
+                    applyCommittedOnlineGuildName(result.guildId,result.name);
+                    addAdminLog('길드명 변경');
+                    showSettingsToast('길드명이 변경되었습니다.');
+                    renderAdminRename();
+                  }catch(error){
+                    const details=String(error?.message||error||'');
+                    showAppDialog('길드명 변경이 서버에 저장되지 않았습니다. 기존 길드명은 유지됩니다.\\n'+details,'길드명 변경 실패');
+                  }finally{button.disabled=false;}
+                  return;
+                }
+                if(changeGuildIdentity(v,null)){
+                  addAdminLog('길드명 변경');showSettingsToast('길드명이 변경되었습니다.');renderAdminRename();
+                }
+              };
+            }
+          '''
+              s=replace_one(s,old,new,'only administrator rename screen')
+
+              anchor="    const rows=Array.isArray(detail.items)?detail.items:[];\n    if(detail.kind==='myRole'){"
+              replacement="""    const rows=Array.isArray(detail.items)?detail.items:[];
+              if(detail.kind==='guildMeta'){
+                if(rows[0]?.name) applyCommittedOnlineGuildName(detail.guildId,rows[0].name);
+                return;
+              }
+              if(detail.kind==='myRole'){"""
+              s=replace_one(s,anchor,replacement,'online guild name refresh event')
+
+              # A guild member who reconnects with an old local name will receive the
+              # canonical latest server name through resumeGuild. Discard stale keys.
+              anchor='''  function onlineGuildLogin(result, code){
+              const key=normalizeKey(result.name,code);
+              const deviceId=getDeviceId();'''
+              replacement='''  function onlineGuildLogin(result, code){
+              const key=normalizeKey(result.name,code);
+              // Renamed guilds keep their ID; move any old login-cache key on resume.
+              const guildsBefore=loadGuilds();
+              for(const [oldKey, oldGuild] of Object.entries(guildsBefore)){
+                if(oldKey===key || !oldGuild?.online || oldGuild.guildId!==result.guildId) continue;
+                if(guildsBefore[key]?.guildId && guildsBefore[key].guildId!==result.guildId) continue;
+                if(!guildsBefore[key]) guildsBefore[key]={...oldGuild,guildName:result.name,guildCode:code};
+                delete guildsBefore[oldKey];
+                migratePersonalKeyPrefix(oldKey,key);
+                const hints=loadOnlineMembershipHints();
+                if(hints[oldKey] && !hints[key]) hints[key]=hints[oldKey];
+                if(hints[oldKey]) delete hints[oldKey];
+                localStorage.setItem(LAST_PLAN_MEMBERSHIP_HINTS,JSON.stringify(hints));
+              }
+              saveGuilds(guildsBefore);
+              const deviceId=getDeviceId();'''
+              s=replace_one(s,anchor,replacement,'relogin renamed guild migration')
+              return s
+
+
+          def patch_rules(s):
+              if MARKER in s:
+                  raise RuntimeError('Guild rename rules already applied')
+              start=s.index('    match /guildDirectory/{joinHash} {')
+              stop=s.index('    match /guilds/{gid} {', start)
+              directory=textwrap.dedent('''
+                  // LASTPLAN_GUILD_RENAME_V42: directory rotate is atomic with guild rename.
+                  match /guildDirectory/{joinHash} {
+                    allow get: if signedIn();
+                    allow list: if false;
+                    // Keep original guild creation unchanged; also permit an existing
+                    // leader to create the replacement directory in an atomic rename.
+                    allow create: if (
+                      signedIn() && validJoinHash(joinHash)
+                      && request.resource.data.keys().hasOnly(['guildId', 'ownerUid', 'createdAt'])
+                      && request.resource.data.ownerUid == request.auth.uid
+                      && getAfter(guildPath(request.resource.data.guildId)).data.ownerUid == request.auth.uid
+                      && getAfter(guildPath(request.resource.data.guildId)).data.joinCodeHash == joinHash
+                      && getAfter(memberPath(request.resource.data.guildId, request.auth.uid)).data.role == 'leader'
+                    ) || (
+                      signedIn() && validJoinHash(joinHash)
+                      && request.resource.data.keys().hasOnly(['guildId', 'ownerUid', 'createdAt'])
+                      && request.resource.data.keys().hasAll(['guildId', 'ownerUid', 'createdAt'])
+                      && request.resource.data.ownerUid == request.auth.uid
+                      && exists(guildPath(request.resource.data.guildId))
+                      && leader(request.resource.data.guildId)
+                      && get(guildPath(request.resource.data.guildId)).data.ownerUid == request.auth.uid
+                      && getAfter(guildPath(request.resource.data.guildId)).data.ownerUid == request.auth.uid
+                      && getAfter(guildPath(request.resource.data.guildId)).data.name != get(guildPath(request.resource.data.guildId)).data.name
+                      && getAfter(guildPath(request.resource.data.guildId)).data.joinCodeHash == joinHash
+                      && !existsAfter(directoryPath(get(guildPath(request.resource.data.guildId)).data.joinCodeHash))
+                    );
+                    allow update: if false;
+                    // Old directory can only disappear when this leader atomically
+                    // commits a new name, a new matching directory, and a new hash.
+                    allow delete: if signedIn()
+                      && validJoinHash(joinHash)
+                      && resource.data.ownerUid == request.auth.uid
+                      && exists(guildPath(resource.data.guildId))
+                      && leader(resource.data.guildId)
+                      && get(guildPath(resource.data.guildId)).data.ownerUid == request.auth.uid
+                      && get(guildPath(resource.data.guildId)).data.joinCodeHash == joinHash
+                      && getAfter(guildPath(resource.data.guildId)).data.ownerUid == request.auth.uid
+                      && getAfter(guildPath(resource.data.guildId)).data.name != get(guildPath(resource.data.guildId)).data.name
+                      && getAfter(guildPath(resource.data.guildId)).data.joinCodeHash != joinHash
+                      && existsAfter(directoryPath(getAfter(guildPath(resource.data.guildId)).data.joinCodeHash))
+                      && getAfter(directoryPath(getAfter(guildPath(resource.data.guildId)).data.joinCodeHash)).data.guildId == resource.data.guildId
+                      && getAfter(directoryPath(getAfter(guildPath(resource.data.guildId)).data.joinCodeHash)).data.ownerUid == request.auth.uid;
+                  }
+
+              ''').strip('\n')
+              directory=textwrap.indent(directory,'    ')+'\n\n'
+              s=s[:start]+directory+s[stop:]
+
+              original='''      // A rename, invite-code change, ownership transfer, and deletion require
+                // dedicated atomic workflows that also update directory and roles.
+                allow update, delete: if false;'''
+              updated='''      // Guild leaders may change the guild NAME ONLY. The directory is
+                // rotated atomically, while owner, guild ID and all subcollections remain.
+                allow update: if signedIn()
+                  && leader(gid)
+                  && resource.data.ownerUid == request.auth.uid
+                  && request.resource.data.ownerUid == resource.data.ownerUid
+                  && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','joinCodeHash','updatedAt'])
+                  && request.resource.data.diff(resource.data).affectedKeys().hasAll(['name','joinCodeHash'])
+                  && request.resource.data.name is string
+                  && request.resource.data.name.size() > 0
+                  && request.resource.data.name.size() <= 30
+                  && request.resource.data.name != resource.data.name
+                  && validJoinHash(request.resource.data.joinCodeHash)
+                  && request.resource.data.joinCodeHash != resource.data.joinCodeHash
+                  && exists(directoryPath(resource.data.joinCodeHash))
+                  && get(directoryPath(resource.data.joinCodeHash)).data.guildId == gid
+                  && get(directoryPath(resource.data.joinCodeHash)).data.ownerUid == request.auth.uid
+                  && !existsAfter(directoryPath(resource.data.joinCodeHash))
+                  && existsAfter(directoryPath(request.resource.data.joinCodeHash))
+                  && getAfter(directoryPath(request.resource.data.joinCodeHash)).data.guildId == gid
+                  && getAfter(directoryPath(request.resource.data.joinCodeHash)).data.ownerUid == request.auth.uid;
+                // Guild code changes, ownership transfers, and deletion remain blocked.
+                allow delete: if false;'''
+              s=replace_one(s,original,updated,'FireStore only guild name update')
+              return s
+
+
+          def main():
+              for path in [JAVA, HTML, JS, RULES]:
+                  if not path.exists():
+                      raise FileNotFoundError(path)
+              new_bridge=patch_bridge(JAVA.read_text(encoding='utf-8'))
+              new_html=patch_html(HTML.read_text(encoding='utf-8'))
+              new_js=patch_js(JS.read_text(encoding='utf-8'))
+              new_rules=patch_rules(RULES.read_text(encoding='utf-8'))
+              # Each file is parsed/replaced in memory first; only after all checks
+              # succeed are any changes written to the build directory.
+              for path, data in [(JAVA,new_bridge),(HTML,new_html),(JS,new_js),(RULES,new_rules)]:
+                  path.write_text(data,encoding='utf-8')
+              print('Guild name rename: native transaction, Firestore authorization, live sync and UI installed')
+
+          if __name__ == '__main__':
+              main()
+          PY
+          node --check build-src/LAST_PLAN_Android/app/src/main/assets/firebase-sync.js
+
       - name: Collect guild identity source for server-safe rename implementation
         run: |
           set -euo pipefail
@@ -980,3 +1322,86 @@ jobs:
           name: LAST-PLAN-APK
           path: dist/LAST-PLAN.apk
           if-no-files-found: error
+
+      - name: Test guild rename permissions in Firestore emulator
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_guild_rename_rules == true }}
+        working-directory: build-src/LAST_PLAN_Android
+        run: |
+          set -euo pipefail
+          cat > firebase-rename-deploy.json <<'JSON'
+          {"firestore":{"rules":"firestore.rules"},"emulators":{"firestore":{"host":"127.0.0.1","port":8086}}}
+          JSON
+          npm install --no-save --no-package-lock firebase@11 @firebase/rules-unit-testing@4 firebase-tools@14
+          mkdir -p tests
+          cat > tests/guild-rename-rules.test.cjs <<'TEST'
+          'use strict';
+          const fs = require('node:fs');
+          const assert = require('node:assert/strict');
+          const { initializeTestEnvironment, assertFails, assertSucceeds } = require('@firebase/rules-unit-testing');
+          const { doc, getDoc, setDoc, updateDoc, writeBatch } = require('firebase/firestore');
+          (async () => {
+            const oldHash='a'.repeat(64), newHash='b'.repeat(64);
+            const env=await initializeTestEnvironment({projectId:'demo-last-plan-rename',firestore:{rules:fs.readFileSync('firestore.rules','utf8')}});
+            try {
+              const owner=env.authenticatedContext('leader1').firestore();
+              const admin=env.authenticatedContext('admin1').firestore();
+              const regular=env.authenticatedContext('member1').firestore();
+              await env.withSecurityRulesDisabled(async ctx => {
+                const db=ctx.firestore();
+                await setDoc(doc(db,'guilds/gid1'), {name:'원래길드',ownerUid:'leader1',joinCodeHash:oldHash,createdAt:'2026-11-20'});
+                await setDoc(doc(db,`guildDirectory/${oldHash}`),{guildId:'gid1',ownerUid:'leader1',createdAt:'2026-11-20'});
+                for(const [uid,role] of [['leader1','leader'],['admin1','admin'],['member1','member']]){
+                  await setDoc(doc(db,`guilds/gid1/members/${uid}`),{uid,role,nickname:uid,joinCodeHash:oldHash,joinedAt:'2026-11-20'});
+                }
+                await setDoc(doc(db,'guilds/gid1/notices/notice1'),{id:'notice1',content:'기존 공지 유지',pinned:false,createdAt:'2026-11-20',updatedAt:'2026-11-20'});
+              });
+              const guild=doc(owner,'guilds/gid1');
+              await assertFails(updateDoc(guild,{name:'단독 변경',joinCodeHash:newHash}));
+              await assertFails(updateDoc(doc(admin,'guilds/gid1'),{name:'관리자 무단 변경',joinCodeHash:newHash}));
+              await assertFails(updateDoc(doc(regular,'guilds/gid1'),{name:'길드원 무단 변경',joinCodeHash:newHash}));
+              await assertFails(updateDoc(guild,{ownerUid:'member1'}));
+              await assertFails(setDoc(doc(owner,`guildDirectory/${newHash}`),{guildId:'gid1',ownerUid:'leader1',createdAt:'2026-11-20'}));
+              const b=writeBatch(owner);
+              b.set(doc(owner,`guildDirectory/${newHash}`),{guildId:'gid1',ownerUid:'leader1',createdAt:'2026-11-20'});
+              b.update(guild,{name:'변경된길드',joinCodeHash:newHash,updatedAt:'2026-11-20'});
+              b.delete(doc(owner,`guildDirectory/${oldHash}`));
+              await assertSucceeds(b.commit());
+              const g=await assertSucceeds(getDoc(guild));
+              assert.equal(g.data().name,'변경된길드');
+              assert.equal(g.data().ownerUid,'leader1');
+              assert.equal((await getDoc(doc(owner,'guilds/gid1/notices/notice1'))).data().content,'기존 공지 유지');
+              await assertSucceeds(getDoc(doc(regular,'guilds/gid1/members/member1')));
+              console.log('PASS: leader atomic rename, preserved notices/members, denied unauthorised/partial rename.');
+            } finally { await env.cleanup(); }
+          })().catch(err=>{console.error(err);process.exitCode=1;});
+          TEST
+          npx firebase emulators:exec --config firebase-rename-deploy.json --only firestore --project demo-last-plan-rename \
+            'node tests/guild-rename-rules.test.cjs'
+
+      - name: Deploy renamed guild rules to Firebase
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_guild_rename_rules == true }}
+        working-directory: build-src/LAST_PLAN_Android
+        env:
+          LASTPLAN_FIREBASE_SERVICE_ACCOUNT: ${{ secrets.LASTPLAN_FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LASTPLAN_FIREBASE_SERVICE_ACCOUNT:-}" ]; then
+            echo '::error::GitHub secret LASTPLAN_FIREBASE_SERVICE_ACCOUNT not configured; production rules remain unchanged.'
+            exit 1
+          fi
+          node - <<'NODE'
+          const fs=require('node:fs');
+          const path=require('node:path');
+          const raw=JSON.parse(process.env.LASTPLAN_FIREBASE_SERVICE_ACCOUNT);
+          if(raw.project_id !== 'last-plan' || !raw.client_email || !raw.private_key){
+            throw new Error('Service account does not match expected Firebase project last-plan. No rules deployed.');
+          }
+          const out=path.join(process.env.RUNNER_TEMP,'lastplan-rename-service-account.json');
+          fs.writeFileSync(out,JSON.stringify(raw),{mode:0o600});
+          fs.appendFileSync(process.env.GITHUB_ENV,`GOOGLE_APPLICATION_CREDENTIALS=${out}\n`);
+          console.log('Verified project ID for Firebase rules deployment.');
+          NODE
+          # Rules are only deployed on manual Run workflow with the explicit checkbox.
+          npx firebase deploy --only firestore:rules --project last-plan \
+            --non-interactive --config firebase-rename-deploy.json
+          echo 'SUCCESS: Firestore rules published for LAST PLAN project.'
