@@ -1728,6 +1728,56 @@ jobs:
           PY
           node --check build-src/LAST_PLAN_Android/app/src/main/assets/firebase-sync.js
 
+      - name: Put staff application button at top of member settings (V44)
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('build-src/LAST_PLAN_Android/app/src/main/assets/index.html')
+          s=p.read_text(encoding='utf-8')
+          
+          old_block='''          <!-- LASTPLAN_ADMIN_REQUEST_AND_CODE_ROTATION_V43: regular-member application -->
+                    <div class="member-settings-group" id="lpAdminApplyGroup" hidden>
+                      <h4 class="member-settings-group-title">관리자 권한</h4>
+                      <button id="lpAdminApplyBtn" class="member-secondary-btn" type="button">관리자 신청</button>
+                    </div>
+          '''
+          new_block='''          <!-- LASTPLAN_V44: visible staff application at the top of member settings -->
+                    <div class="member-settings-group" id="lpAdminApplyGroup">
+                      <h4 class="member-settings-group-title">운영진 권한 신청</h4>
+                      <p class="member-settings-help" style="padding:0 15px">길드장에게 운영진 권한을 신청할 수 있습니다. 승인 후 이용할 수 있어요.</p>
+                      <button id="lpAdminApplyBtn" class="member-secondary-btn" type="button">운영진 신청</button>
+                    </div>
+          '''
+          
+          start='<section id="memberSettingsPanel" class="member-settings-panel">'
+          if s.count(old_block)!=1: raise RuntimeError('Cannot find V43 member application block')
+          if s.count(start)!=1: raise RuntimeError('Cannot find member settings panel')
+          s=s.replace(old_block,'',1)
+          s=s.replace(start,start+'\n'+new_block,1)
+          
+          old_visibility="if(lpApplyGroup) lpApplyGroup.hidden=getCurrentGuildAndMember().member?.role!=='일반 길드원';"
+          new_visibility="if(lpApplyGroup) lpApplyGroup.hidden=currentUserCanManage();"
+          if s.count(old_visibility)!=1: raise RuntimeError('Cannot find original application visibility rule')
+          s=s.replace(old_visibility,new_visibility,1)
+          
+          # Settings can be re-rendered without reactivating the Settings tab, so refresh visibility here too.
+          old_settings="    const canManage = member && (member.role === '길드장' || member.role === '관리자');\n    syncModeControls(localStorage.getItem('guildScheduleViewMode') || 'member', canManage);"
+          new_settings="    const canManage = member && (member.role === '길드장' || member.role === '관리자');\n    const applyGroup=document.getElementById('lpAdminApplyGroup');\n    if(applyGroup) applyGroup.hidden=!!canManage;\n    syncModeControls(localStorage.getItem('guildScheduleViewMode') || 'member', canManage);"
+          if s.count(old_settings)!=1: raise RuntimeError('Cannot find member settings render visibility location')
+          s=s.replace(old_settings,new_settings,1)
+          
+          # If a login session's local label is not yet normalized, do not hide the application from a non-manager.
+          old_guard="if(!ctx.guild || !ctx.member || ctx.member.role!=='일반 길드원'){"
+          new_guard="if(!ctx.guild || !ctx.member || ctx.member.role==='길드장' || ctx.member.role==='관리자'){"
+          if s.count(old_guard)!=1: raise RuntimeError('Cannot find regular member click guard')
+          s=s.replace(old_guard,new_guard,1)
+          
+          if s.count('id="lpAdminApplyBtn"')!=1 or s.count('id="lpAdminApplyGroup"')!=1:
+              raise RuntimeError('Admin application UI missing or duplicated')
+          p.write_text(s,encoding='utf-8')
+          print('V44: application button visible at top of Settings for non-managers; old operation preserved')
+          PY
+
       - name: Collect guild identity source for server-safe rename implementation
         run: |
           set -euo pipefail
