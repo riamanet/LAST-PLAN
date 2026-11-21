@@ -1289,6 +1289,445 @@ jobs:
           PY
           node --check build-src/LAST_PLAN_Android/app/src/main/assets/firebase-sync.js
 
+      - name: Enable guild-code rotation and online admin applications (V43)
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+          
+          BASE = Path('build-src/LAST_PLAN_Android')
+          JAVA = BASE / 'app/src/main/java/com/lastplan/app/LastPlanBridge.java'
+          HTML = BASE / 'app/src/main/assets/index.html'
+          JS = BASE / 'app/src/main/assets/firebase-sync.js'
+          RULES = BASE / 'firestore.rules'
+          MARK = 'LASTPLAN_ADMIN_REQUEST_AND_CODE_ROTATION_V43'
+          
+          
+          def one(s, old, new, label):
+              matches=s.count(old)
+              if matches != 1:
+                  raise ValueError(f'{label}: expected exactly one match; found {matches}')
+              return s.replace(old,new,1)
+          
+          
+          def java_patch(s):
+              if MARK in s:
+                  raise ValueError('V43 native code already present')
+              s=one(s,
+                '                    case "renameGuild": renameGuild(requestId, payload); return;',
+                '''                    case "renameGuild": renameGuild(requestId, payload); return;
+                              case "rotateGuildCode": rotateGuildCode(requestId, payload); return;
+                              case "submitAdminRequest": submitAdminRequest(requestId, payload); return;
+                              case "listAdminRequests": listAdminRequests(requestId, payload); return;
+                              case "approveAdminRequest": handleAdminRequest(requestId, payload, true); return;
+                              case "rejectAdminRequest": handleAdminRequest(requestId, payload, false); return;''', 'native operation dispatch')
+              funcs = r'''    /** LASTPLAN_ADMIN_REQUEST_AND_CODE_ROTATION_V43 */
+              private void rotateGuildCode(String req, JSONObject p) throws Exception {
+                  String gid = docId(required(p, "guildId", 120));
+                  String oldCode = required(p, "oldCode", 64);
+                  String newCode = required(p, "newCode", 64);
+                  if (oldCode.equals(newCode)) throw new IllegalArgumentException("guild_code_unchanged");
+                  String uid = signedIn().getUid();
+                  DocumentReference guild = db.collection("guilds").document(gid);
+                  DocumentReference myself = guild.collection("members").document(uid);
+                  String now = nowIso();
+                  db.runTransaction(tx -> {
+                      // Read all documents before any write.
+                      DocumentSnapshot g = tx.get(guild);
+                      DocumentSnapshot m = tx.get(myself);
+                      if (!g.exists() || !m.exists() || !uid.equals(g.getString("ownerUid"))
+                              || !"leader".equals(m.getString("role")))
+                          throw new IllegalStateException("only_guild_leader_can_change_code");
+                      String name = safe(g.getString("name"));
+                      String oldHash = safe(g.getString("joinCodeHash"));
+                      String candidateOld, legacyOld, candidateNew;
+                      try {
+                          candidateOld = hashJoin(name, oldCode);
+                          legacyOld = legacyHashJoin(name, oldCode);
+                          candidateNew = hashJoin(name, newCode);
+                      } catch (Exception digestError) {
+                          throw new IllegalStateException("guild_hash_failed", digestError);
+                      }
+                      if (!oldHash.equals(candidateOld) && !oldHash.equals(legacyOld))
+                          throw new IllegalArgumentException("guild_code_mismatch");
+                      if (oldHash.equals(candidateNew))
+                          throw new IllegalArgumentException("guild_code_unchanged");
+                      DocumentReference previous = db.collection("guildDirectory").document(oldHash);
+                      DocumentReference replacement = db.collection("guildDirectory").document(candidateNew);
+                      DocumentSnapshot oldEntry = tx.get(previous);
+                      DocumentSnapshot newEntry = tx.get(replacement);
+                      if (!oldEntry.exists() || !gid.equals(oldEntry.getString("guildId"))
+                              || !uid.equals(oldEntry.getString("ownerUid")))
+                          throw new IllegalStateException("guild_directory_mismatch");
+                      if (newEntry.exists()) throw new IllegalStateException("guild_already_exists");
+                      Map<String,Object> directory = new HashMap<>();
+                      directory.put("guildId", gid);
+                      directory.put("ownerUid", uid);
+                      directory.put("createdAt", now);
+                      // The guild ID, name, owner, existing members and subcollections do not change.
+                      tx.set(replacement, directory);
+                      tx.update(guild, "joinCodeHash", candidateNew, "updatedAt", now);
+                      tx.delete(previous);
+                      return gid;
+                  }).addOnSuccessListener(saved -> completeMembership(req, gid))
+                    .addOnFailureListener(e -> failure(req, e));
+              }
+          
+              private void submitAdminRequest(String req, JSONObject p) throws Exception {
+                  String gid = docId(required(p, "guildId", 120));
+                  String uid = signedIn().getUid();
+                  DocumentReference guild = db.collection("guilds").document(gid);
+                  DocumentReference me = guild.collection("members").document(uid);
+                  DocumentReference application = guild.collection("adminRequests").document(uid);
+                  db.runTransaction(tx -> {
+                      DocumentSnapshot member = tx.get(me);
+                      DocumentSnapshot old = tx.get(application);
+                      if (!member.exists() || !"member".equals(member.getString("role")))
+                          throw new IllegalStateException("only_regular_members_can_apply");
+                      if (old.exists()) return "already_pending";
+                      Map<String,Object> data = new HashMap<>();
+                      data.put("senderUid", uid);
+                      data.put("nickname", safe(member.getString("nickname")));
+                      data.put("status", "pending");
+                      data.put("createdAt", nowIso());
+                      tx.set(application, data);
+                      return "submitted";
+                  }).addOnSuccessListener(status -> {
+                      JSONObject result = new JSONObject();
+                      try { result.put("status", status); } catch (Exception ignored) {}
+                      success(req, result);
+                  }).addOnFailureListener(e -> failure(req, e));
+              }
+          
+              private void listAdminRequests(String req, JSONObject p) throws Exception {
+                  String gid = docId(required(p, "guildId", 120));
+                  String uid = signedIn().getUid();
+                  DocumentReference guild = db.collection("guilds").document(gid);
+                  guild.collection("members").document(uid).get().addOnSuccessListener(me -> {
+                      if (!me.exists() || !"leader".equals(me.getString("role"))) {
+                          failure(req, new IllegalStateException("only_guild_leader_can_review_requests"));
+                          return;
+                      }
+                      guild.get().addOnSuccessListener(g -> {
+                          if (!g.exists() || !uid.equals(g.getString("ownerUid"))) {
+                              failure(req, new IllegalStateException("not_guild_owner"));
+                              return;
+                          }
+                          guild.collection("adminRequests").get().addOnSuccessListener(snapshot -> {
+                              JSONArray items = new JSONArray();
+                              for (DocumentSnapshot item : snapshot.getDocuments()) {
+                                  if (!"pending".equals(item.getString("status"))) continue;
+                                  JSONObject obj = new JSONObject(item.getData());
+                                  try { obj.put("id", item.getId()); } catch (Exception ignored) {}
+                                  items.put(obj);
+                              }
+                              JSONObject response = new JSONObject();
+                              try { response.put("items", items); } catch (Exception ignored) {}
+                              success(req, response);
+                          }).addOnFailureListener(e -> failure(req, e));
+                      }).addOnFailureListener(e -> failure(req, e));
+                  }).addOnFailureListener(e -> failure(req, e));
+              }
+          
+              private void handleAdminRequest(String req, JSONObject p, boolean approve) throws Exception {
+                  String gid = docId(required(p, "guildId", 120));
+                  String targetUid = docId(required(p, "uid", 120));
+                  String uid = signedIn().getUid();
+                  if (uid.equals(targetUid)) throw new IllegalArgumentException("cannot_approve_self");
+                  DocumentReference guild = db.collection("guilds").document(gid);
+                  DocumentReference leader = guild.collection("members").document(uid);
+                  DocumentReference target = guild.collection("members").document(targetUid);
+                  DocumentReference application = guild.collection("adminRequests").document(targetUid);
+                  db.runTransaction(tx -> {
+                      DocumentSnapshot g = tx.get(guild);
+                      DocumentSnapshot me = tx.get(leader);
+                      DocumentSnapshot applicant = tx.get(target);
+                      DocumentSnapshot request = tx.get(application);
+                      if (!g.exists() || !uid.equals(g.getString("ownerUid")) || !me.exists()
+                              || !"leader".equals(me.getString("role")))
+                          throw new IllegalStateException("only_guild_leader_can_review_requests");
+                      if (!request.exists() || !targetUid.equals(request.getString("senderUid"))
+                              || !"pending".equals(request.getString("status")))
+                          throw new IllegalStateException("admin_request_missing");
+                      if (!applicant.exists() || !"member".equals(applicant.getString("role")))
+                          throw new IllegalStateException("applicant_not_regular_member");
+                      if (approve) tx.update(target, "role", "admin");
+                      // Remove a handled request so a member demoted later can reapply.
+                      tx.delete(application);
+                      return approve ? "approved" : "rejected";
+                  }).addOnSuccessListener(status -> {
+                      JSONObject result = new JSONObject();
+                      try { result.put("status", status); } catch (Exception ignored) {}
+                      success(req, result);
+                  }).addOnFailureListener(e -> failure(req, e));
+              }
+          
+          '''
+              s=one(s, '    private void joinGuild(String req, JSONObject p) throws Exception {',
+                      funcs+'    private void joinGuild(String req, JSONObject p) throws Exception {',
+                      'native server operations')
+              return s
+          
+          
+          def js_patch(s):
+              if MARK in s:
+                  raise ValueError('V43 JS already present')
+              s=one(s,'    renameGuild: (guildId, name, code) => call(\'renameGuild\', {guildId, name, code}),',
+                '''    renameGuild: (guildId, name, code) => call('renameGuild', {guildId, name, code}),
+              // LASTPLAN_ADMIN_REQUEST_AND_CODE_ROTATION_V43
+              rotateGuildCode: (guildId, oldCode, newCode) => call('rotateGuildCode', {guildId, oldCode, newCode}),
+              submitAdminRequest: guildId => call('submitAdminRequest', {guildId}),
+              listAdminRequests: guildId => call('listAdminRequests', {guildId}),
+              approveAdminRequest: (guildId, uid) => call('approveAdminRequest', {guildId, uid}),
+              rejectAdminRequest: (guildId, uid) => call('rejectAdminRequest', {guildId, uid}),''', 'JS adapter operations')
+              return s
+          
+          
+          def html_patch(s):
+              if MARK in s:
+                  raise ValueError('V43 HTML already present')
+              # Add one unobtrusive menu item to the existing member settings without changing any bottom tabs.
+              s=one(s,'          <button id="memberLogout" class="member-secondary-btn" type="button">로그아웃</button>',
+                '''          <!-- LASTPLAN_ADMIN_REQUEST_AND_CODE_ROTATION_V43: regular-member application -->
+                    <div class="member-settings-group" id="lpAdminApplyGroup" hidden>
+                      <h4 class="member-settings-group-title">관리자 권한</h4>
+                      <button id="lpAdminApplyBtn" class="member-secondary-btn" type="button">관리자 신청</button>
+                    </div>
+                    <button id="memberLogout" class="member-secondary-btn" type="button">로그아웃</button>''', 'member settings admin apply button')
+              s=one(s, '    renderMemberSettings();\n    if(memberSettingsModeSwitch){',
+                 '''    renderMemberSettings();
+              const lpApplyGroup=document.getElementById('lpAdminApplyGroup');
+              if(lpApplyGroup) lpApplyGroup.hidden=getCurrentGuildAndMember().member?.role!=='일반 길드원';
+              if(memberSettingsModeSwitch){''', 'member application visibility')
+              new_requests = r'''  async function renderAdminRequests(){
+              openAdminFeature('관리자 신청 관리');
+              const ctx=currentAdminContext();
+              if(!isCurrentLeader()){
+                adminFeatureBody.innerHTML='<div class="admin-empty-state">관리자 신청 승인은 길드장만 가능합니다.</div>';
+                return;
+              }
+              let rows=[];
+              if(isOnlineSession()){
+                adminFeatureBody.innerHTML='<div class="admin-empty-state">신청 내역을 확인하고 있습니다.</div>';
+                try{
+                  await awaitNativeAuthentication();
+                  if(!online?.listAdminRequests) throw new Error('앱 업데이트가 필요합니다.');
+                  const response=await online.listAdminRequests(ctx.guild.guildId);
+                  rows=Array.isArray(response.items)?response.items:[];
+                }catch(error){
+                  adminFeatureBody.innerHTML='<div class="admin-empty-state">신청 목록을 불러오지 못했습니다.</div>';
+                  showAppDialog('서버에서 신청 내역을 가져오지 못했습니다.\n'+String(error?.message||error),'관리자 신청 오류');
+                  return;
+                }
+              }else rows=loadAdminArray('adminRequests');
+              rows=rows.filter(r=>r&&(!r.status||r.status==='pending'));
+              adminFeatureBody.innerHTML='';
+              if(!rows.length){
+                adminFeatureBody.innerHTML='<div class="admin-empty-state">대기 중인 관리자 신청이 없습니다.</div>';
+                return;
+              }
+              rows.forEach(r=>{
+                const uid=String(r.senderUid||r.memberId||'');
+                if(!uid) return;
+                const row=document.createElement('div');
+                row.className='admin-member-row';
+                const copy=document.createElement('div'); copy.className='admin-member-copy';
+                const nick=document.createElement('strong');nick.textContent=String(r.nickname||r.adminNick||'길드원');
+                const stamp=document.createElement('span');stamp.textContent=formatAdminDate(r.createdAt);
+                copy.append(nick,stamp);
+                const approve=document.createElement('button');approve.type='button';approve.textContent='승인';
+                const reject=document.createElement('button');reject.type='button';reject.textContent='거절';
+                async function handle(approved){
+                  approve.disabled=true;reject.disabled=true;
+                  try{
+                    if(isOnlineSession()){
+                      await awaitNativeAuthentication();
+                      const action=approved?online?.approveAdminRequest:online?.rejectAdminRequest;
+                      if(typeof action!=='function') throw new Error('앱 업데이트가 필요합니다.');
+                      await action(ctx.guild.guildId,uid);
+                    }else{
+                      if(approved) updateMemberRole(uid,'관리자');
+                      saveAdminArray('adminRequests',loadAdminArray('adminRequests').filter(x=>x.memberId!==uid));
+                    }
+                    addAdminLog(approved?'관리자 신청 승인':'관리자 신청 거절');
+                    showSettingsToast(approved?'관리자 신청을 승인했습니다.':'관리자 신청을 거절했습니다.');
+                    renderAdminRequests();
+                  }catch(error){
+                    approve.disabled=false;reject.disabled=false;
+                    showAppDialog('처리 결과가 서버에 저장되지 않았습니다.\n'+String(error?.message||error),'관리자 신청 오류');
+                  }
+                }
+                approve.onclick=()=>handle(true);
+                reject.onclick=()=>handle(false);
+                row.append(copy,approve,reject);
+                adminFeatureBody.appendChild(row);
+              });
+            }
+          
+          '''
+              start=s.index('  function renderAdminRequests(){')
+              end=s.index('  function renderAdminMembers(){',start)
+              s=s[:start]+new_requests+s[end:]
+          
+              before=r'''  function renderAdminCode(){
+              openAdminFeature('길드코드 관리'); const ctx=currentAdminContext();
+              adminFeatureBody.innerHTML=`<div class="admin-info-list"><div class="admin-info-row"><span>현재 길드코드</span><strong class="admin-code-display">${adminEscape(ctx.guild.guildCode)}</strong></div></div><div class="admin-form"><label>새 길드코드<input id="adminCodeInput" maxlength="24" placeholder="새 길드코드"></label><div class="admin-action-bar"><button id="adminCodeSave" class="admin-primary-btn" type="button">변경</button></div></div>`;
+              document.getElementById('adminCodeSave').onclick=()=>{const v=document.getElementById('adminCodeInput').value.trim(); if(!v){showAppDialog('새 길드코드를 입력해주세요.','길드코드 관리');return;} if(changeGuildIdentity(null,v)){addAdminLog('길드코드 변경');showSettingsToast('길드코드가 변경되었습니다.');renderAdminCode();}};
+            }
+          '''
+              after=r'''  function applyCommittedOnlineGuildCode(gid, nextCode){
+              const ctx=getCurrentGuildAndMember();
+              if(!ctx.guild?.online || ctx.guild.guildId!==gid) return;
+              const code=String(nextCode||'').trim();
+              if(!code || code===ctx.guild.guildCode) return;
+              const oldKey=ctx.key;
+              const newKey=normalizeKey(ctx.guild.guildName,code);
+              const all=ctx.guilds;
+              if(all[newKey] && all[newKey].guildId!==gid){
+                showAppDialog('새 코드로 저장된 다른 길드 정보가 있어 자동 갱신하지 못했습니다.','길드 정보 갱신');
+                return;
+              }
+              const updated={...ctx.guild,guildCode:code};
+              delete all[oldKey];all[newKey]=updated;
+              saveGuilds(all);
+              if(oldKey!==newKey) migratePersonalKeyPrefix(oldKey,newKey);
+              saveSession(newKey,ctx.member);
+              const hints=loadOnlineMembershipHints();
+              if(hints[oldKey]){
+                hints[newKey]={...hints[oldKey],updatedAt:Date.now()};
+                if(oldKey!==newKey) delete hints[oldKey];
+                localStorage.setItem(LAST_PLAN_MEMBERSHIP_HINTS,JSON.stringify(hints));
+              }
+              syncWidgetNow(true);
+            }
+          
+            function renderAdminCode(){
+              openAdminFeature('길드코드 관리'); const ctx=currentAdminContext();
+              if(!isCurrentLeader()){
+                adminFeatureBody.innerHTML='<div class="admin-empty-state">길드코드 변경은 길드장만 가능합니다.</div>';
+                return;
+              }
+              adminFeatureBody.innerHTML=`<div class="admin-info-list"><div class="admin-info-row"><span>현재 길드코드</span><strong class="admin-code-display">${adminEscape(ctx.guild.guildCode)}</strong></div></div><div class="admin-form"><label>새 길드코드<input id="adminCodeInput" maxlength="24" placeholder="새 길드코드"></label><div class="admin-action-bar"><button id="adminCodeSave" class="admin-primary-btn" type="button">변경</button></div></div>`;
+              document.getElementById('adminCodeSave').onclick=async()=>{
+                const field=document.getElementById('adminCodeInput');
+                const button=document.getElementById('adminCodeSave');
+                const v=field.value.trim();
+                if(!v){showAppDialog('새 길드코드를 입력해주세요.','길드코드 관리');return;}
+                if(v===ctx.guild.guildCode){showSettingsToast('현재 길드코드와 같습니다.');return;}
+                if(isOnlineSession()){
+                  const oldCode=String(ctx.guild.guildCode||'').trim();
+                  if(!oldCode){showAppDialog('기존 길드코드를 확인할 수 없습니다.','길드코드 관리');return;}
+                  button.disabled=true;
+                  try{
+                    await awaitNativeAuthentication();
+                    if(typeof online?.rotateGuildCode!=='function') throw new Error('앱 업데이트가 필요합니다.');
+                    const result=await online.rotateGuildCode(ctx.guild.guildId,oldCode,v);
+                    applyCommittedOnlineGuildCode(result.guildId,v);
+                    addAdminLog('길드코드 변경');showSettingsToast('길드코드가 변경되었습니다.');renderAdminCode();
+                  }catch(error){
+                    showAppDialog('길드코드 변경에 실패했습니다. 기존 길드코드는 유지됩니다.\n'+String(error?.message||error),'길드코드 변경 실패');
+                  }finally{button.disabled=false;}
+                  return;
+                }
+                if(changeGuildIdentity(null,v)){
+                  addAdminLog('길드코드 변경');showSettingsToast('길드코드가 변경되었습니다.');renderAdminCode();
+                }
+              };
+            }
+          
+            document.getElementById('lpAdminApplyBtn').addEventListener('click',async()=>{
+              const ctx=getCurrentGuildAndMember();
+              if(!ctx.guild || !ctx.member || ctx.member.role!=='일반 길드원'){
+                showAppDialog('일반 길드원만 관리자 신청을 할 수 있습니다.','관리자 신청');return;
+              }
+              const button=document.getElementById('lpAdminApplyBtn');
+              button.disabled=true;
+              try{
+                if(isOnlineSession()){
+                  await awaitNativeAuthentication();
+                  if(typeof online?.submitAdminRequest!=='function') throw new Error('앱 업데이트가 필요합니다.');
+                  const response=await online.submitAdminRequest(ctx.guild.guildId);
+                  showAppDialog(response.status==='already_pending'?'이미 접수된 관리자 신청이 있습니다.':'관리자 신청이 접수되었습니다. 길드장의 승인을 기다려주세요.','관리자 신청');
+                }else{
+                  const rows=loadAdminArray('adminRequests');
+                  if(rows.some(x=>x.memberId===ctx.member.memberId)){
+                    showAppDialog('이미 접수된 관리자 신청이 있습니다.','관리자 신청');
+                  }else{
+                    rows.push({memberId:ctx.member.memberId,nickname:ctx.member.nickname||'길드원',createdAt:new Date().toISOString(),status:'pending'});
+                    saveAdminArray('adminRequests',rows);
+                    showAppDialog('이 기기에 관리자 신청이 접수되었습니다.','관리자 신청');
+                  }
+                }
+              }catch(error){
+                showAppDialog('관리자 신청이 저장되지 않았습니다.\n'+String(error?.message||error),'관리자 신청 오류');
+              }finally{button.disabled=false;}
+            });
+          '''
+              s=one(s,before,after,'online guild code UI')
+              return s
+          
+          
+          def rules_patch(s):
+              if MARK in s: raise ValueError('V43 Firestore rules already patched')
+              s=one(s, 'request.resource.data.diff(resource.data).affectedKeys().hasAll([\'name\',\'joinCodeHash\'])',
+                    'request.resource.data.diff(resource.data).affectedKeys().hasAll([\'joinCodeHash\'])',
+                    'allow code-only changed keys')
+              s=one(s,'        && request.resource.data.name != resource.data.name\n',
+                  '', 'remove name-must-change condition')
+              # These two conditions are in directory create/delete only. Rotate when hash changes even if name stays identical.
+              match='getAfter(guildPath(request.resource.data.guildId)).data.name != get(guildPath(request.resource.data.guildId)).data.name'
+              s=one(s,match,
+                 'getAfter(guildPath(request.resource.data.guildId)).data.joinCodeHash != get(guildPath(request.resource.data.guildId)).data.joinCodeHash',
+                 'directory create code-only rotation')
+              match='getAfter(guildPath(resource.data.guildId)).data.name != get(guildPath(resource.data.guildId)).data.name'
+              s=one(s,match,
+                 'getAfter(guildPath(resource.data.guildId)).data.joinCodeHash != get(guildPath(resource.data.guildId)).data.joinCodeHash',
+                 'directory deletion code-only rotation')
+              # One active request per member UID, no impersonation, and no role escalation via a request.
+              old_requests='''      match /adminRequests/{requestId} {
+                  allow create: if member(gid)
+                    && request.resource.data.senderUid == request.auth.uid
+                    && request.resource.data.status == 'pending';
+                  allow get: if manager(gid) || (member(gid) && resource.data.senderUid == request.auth.uid);
+                  allow list: if manager(gid);
+                  allow update, delete: if leader(gid);
+                }'''
+              new_requests='''      match /adminRequests/{requestId} {
+                  allow create: if member(gid)
+                    && get(memberPath(gid, request.auth.uid)).data.role == 'member'
+                    && requestId == request.auth.uid
+                    && request.resource.data.keys().hasOnly(['senderUid','nickname','status','createdAt'])
+                    && request.resource.data.keys().hasAll(['senderUid','nickname','status','createdAt'])
+                    && request.resource.data.senderUid == request.auth.uid
+                    && request.resource.data.nickname is string
+                    && request.resource.data.nickname.size() > 0
+                    && request.resource.data.nickname.size() <= 40
+                    && request.resource.data.createdAt is string
+                    && request.resource.data.createdAt.size() <= 40
+                    && request.resource.data.status == 'pending';
+                  // Permit a member to read their own request ID even before the document exists.
+                  allow get: if manager(gid) || (member(gid) && requestId == request.auth.uid);
+                  allow list: if manager(gid);
+                  allow update, delete: if leader(gid);
+                }'''
+              s=one(s,old_requests,new_requests,'secure admin applications')
+              s='// '+MARK+' (code-only directory rotation and secured member requests)\n'+s
+              return s
+          
+          
+          def main():
+              for path in (JAVA,HTML,JS,RULES):
+                  if not path.is_file():raise FileNotFoundError(path)
+              result={JAVA:java_patch(JAVA.read_text()), HTML:html_patch(HTML.read_text()),
+                      JS:js_patch(JS.read_text()), RULES:rules_patch(RULES.read_text())}
+              # Only overwrite after all patterns match and every change was prepared in memory.
+              for path,value in result.items(): path.write_text(value)
+              print('V43: code-only rotation, member applications and leader approval/rejection added')
+          
+          if __name__=='__main__': main()
+          PY
+          node --check build-src/LAST_PLAN_Android/app/src/main/assets/firebase-sync.js
+
       - name: Collect guild identity source for server-safe rename implementation
         run: |
           set -euo pipefail
@@ -1349,8 +1788,7 @@ jobs:
           path: dist/LAST-PLAN.apk
           if-no-files-found: error
 
-      - name: Test guild rename permissions in Firestore emulator
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_guild_rename_rules == true }}
+      - name: Test guild rename, code rotation and admin application rules in Firestore emulator
         working-directory: build-src/LAST_PLAN_Android
         run: |
           set -euo pipefail
@@ -1397,7 +1835,33 @@ jobs:
               assert.equal(g.data().ownerUid,'leader1');
               assert.equal((await getDoc(doc(owner,'guilds/gid1/notices/notice1'))).data().content,'기존 공지 유지');
               await assertSucceeds(getDoc(doc(regular,'guilds/gid1/members/member1')));
-              console.log('PASS: leader atomic rename, preserved notices/members, denied unauthorised/partial rename.');
+              // Code-only change must rotate the directory atomically without changing name or member IDs.
+              await assertFails(updateDoc(guild,{joinCodeHash:'d'.repeat(64)}));
+              const codeHash='c'.repeat(64);
+              const codeRotation=writeBatch(owner);
+              codeRotation.set(doc(owner,`guildDirectory/${codeHash}`),{guildId:'gid1',ownerUid:'leader1',createdAt:'2026-11-20'});
+              codeRotation.update(guild,{joinCodeHash:codeHash,updatedAt:'2026-11-20'});
+              codeRotation.delete(doc(owner,`guildDirectory/${newHash}`));
+              await assertSucceeds(codeRotation.commit());
+              const afterCode=await assertSucceeds(getDoc(guild));
+              assert.equal(afterCode.data().name,'변경된길드');
+              assert.equal(afterCode.data().joinCodeHash,codeHash);
+              assert.equal(afterCode.data().ownerUid,'leader1');
+              assert.equal((await getDoc(doc(owner,'guilds/gid1/notices/notice1'))).data().content,'기존 공지 유지');
+              // Members cannot promote themselves; one pending request is visible to its owner.
+              const requestRef=doc(regular,'guilds/gid1/adminRequests/member1');
+              await assertSucceeds(getDoc(requestRef));
+              await assertFails(setDoc(doc(regular,'guilds/gid1/adminRequests/admin1'),{senderUid:'member1',nickname:'member1',createdAt:'2026-11-20',status:'pending'}));
+              await assertSucceeds(setDoc(requestRef,{senderUid:'member1',nickname:'member1',createdAt:'2026-11-20',status:'pending'}));
+              await assertSucceeds(getDoc(requestRef));
+              await assertFails(updateDoc(doc(regular,'guilds/gid1/members/member1'),{role:'admin'}));
+              const approval=writeBatch(owner);
+              approval.update(doc(owner,'guilds/gid1/members/member1'),{role:'admin'});
+              approval.delete(doc(owner,'guilds/gid1/adminRequests/member1'));
+              await assertSucceeds(approval.commit());
+              const promoted=await assertSucceeds(getDoc(doc(regular,'guilds/gid1/members/member1')));
+              assert.equal(promoted.data().role,'admin');
+              console.log('PASS: atomic name/code rotation, preserved data, admin request and leader-only approval.');
             } finally { await env.cleanup(); }
           })().catch(err=>{console.error(err);process.exitCode=1;});
           TEST
