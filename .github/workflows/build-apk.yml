@@ -211,6 +211,42 @@ jobs:
           print('In-app gift icon, unread badge and coupon panel installed')
           PY
 
+      - name: Load coupon list with fetch instead of JSONP
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          coupon = Path('build-src/LAST_PLAN_Android/app/src/main/assets/lastplan-coupon.js')
+          source = coupon.read_text(encoding='utf-8')
+          start = source.find('  function fetchSheetJSONP() {')
+          end = source.find('  async function refresh() {', start)
+          if start == -1 or end == -1 or source.count('fetchSheetJSONP()') != 2:
+              raise RuntimeError('Expected coupon JSONP loader was not found')
+          fetch_loader = """  // Same Apps Script endpoint, read as plain JSON. Unlike JSONP the response is never
+            // executed as code in the WebView that exposes the native bridges, and fetch() does not
+            // hold back the page load event that the native Firebase status injection waits for.
+            async function fetchSheetJSON() {
+              const controller = typeof AbortController === 'function' ? new AbortController() : null;
+              const timeout = controller ? setTimeout(() => controller.abort(), 9000) : null;
+              try {
+                const response = await fetch(GUIDE_ENDPOINT + '?t=' + Date.now(), {
+                  cache:'no-store', ...(controller ? {signal:controller.signal} : {})
+                });
+                if (!response.ok) throw Error('HTTP ' + response.status);
+                const data = await response.json();
+                if (data && Array.isArray(data.codes)) {sheetData = data; return true;}
+              } catch (_) {} finally { if (timeout) clearTimeout(timeout); }
+              return false;
+            }
+          """
+          source = source[:start] + fetch_loader + source[end:]
+          source = source.replace('fetchSheetJSONP()', 'fetchSheetJSON()', 1)
+          if 'fetchSheetJSONP' in source or "document.createElement('script')" in source:
+              raise RuntimeError('JSONP coupon loader is still present')
+          coupon.write_text(source, encoding='utf-8')
+          print('Coupons: Apps Script list now loaded with fetch() JSON; no script injection')
+          PY
+
       - name: Fix Settings admin mode button in the gift position
         run: |
           python3 - <<'PY'
@@ -1797,48 +1833,18 @@ jobs:
           path: guild-identity-source/
           if-no-files-found: error
 
-      - name: Restore signing key
-        env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: |
-          test -n "$KEYSTORE_BASE64" || (echo "Missing ANDROID_KEYSTORE_BASE64 secret" && exit 1)
-          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/LAST_PLAN_release.jks"
-
-      - name: Build release APK
+      - name: Run bundled regression tests on the patched source
         working-directory: build-src/LAST_PLAN_Android
-        run: gradle :app:assembleRelease --no-daemon
-
-      - name: Sign APK with fixed key
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
-          test -n "$KEYSTORE_PASSWORD" || (echo "Missing ANDROID_KEYSTORE_PASSWORD secret" && exit 1)
-          mkdir -p dist
-          UNSIGNED="build-src/LAST_PLAN_Android/app/build/outputs/apk/release/app-release-unsigned.apk"
-          ALIGNED="$RUNNER_TEMP/LAST-PLAN-aligned.apk"
-          ZIPALIGN="$ANDROID_SDK_ROOT/build-tools/35.0.0/zipalign"
-          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner"
+          set -euo pipefail
+          # v1.48-v1.50 snapshot tests pin old version numbers/layouts on purpose and are not run here.
+          for t in tests/v147-changes.test.cjs tests/asset-references.test.cjs tests/firebase-security-guards.test.js tests/firebase-sync.test.js \
+                   tests/notification-integration.test.js tests/widget-guards.test.js \
+                   functions/test/reminder-logic.test.js github-push/test/pure.test.cjs; do
+            echo "::group::$t"; node "$t"; echo "::endgroup::"
+          done
 
-          "$ZIPALIGN" -f -p 4 "$UNSIGNED" "$ALIGNED"
-
-          "$APKSIGNER" sign \
-            --ks "$RUNNER_TEMP/LAST_PLAN_release.jks" \
-            --ks-key-alias lastplan \
-            --ks-pass "pass:$KEYSTORE_PASSWORD" \
-            --key-pass "pass:$KEYSTORE_PASSWORD" \
-            --out dist/LAST-PLAN.apk \
-            "$ALIGNED"
-
-          "$APKSIGNER" verify --verbose --print-certs dist/LAST-PLAN.apk
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: LAST-PLAN-APK
-          path: dist/LAST-PLAN.apk
-          if-no-files-found: error
-
-      - name: Test guild rename, code rotation and admin application rules in Firestore emulator
+      - name: Test patched Firestore rules in emulator before building the APK
         working-directory: build-src/LAST_PLAN_Android
         run: |
           set -euo pipefail
@@ -1915,8 +1921,113 @@ jobs:
             } finally { await env.cleanup(); }
           })().catch(err=>{console.error(err);process.exitCode=1;});
           TEST
+          cat > tests/firestore-base-permissions.test.cjs <<'LASTPLAN_BASE_TEST'
+          'use strict';
+          const fs = require('node:fs');
+          const assert = require('node:assert/strict');
+          const { initializeTestEnvironment, assertFails, assertSucceeds } = require('@firebase/rules-unit-testing');
+          const { doc, collection, getDoc, getDocs, setDoc, updateDoc, writeBatch } = require('firebase/firestore');
+          
+          (async () => {
+            const env = await initializeTestEnvironment({
+              projectId: 'demo-last-plan-rules',
+              firestore: { rules: fs.readFileSync('firestore.rules', 'utf8') },
+            });
+            try {
+              const p = 'guilds/guildA';
+              const hash = 'a'.repeat(64);
+              const owner = env.authenticatedContext('leader-1').firestore();
+              const admin = env.authenticatedContext('admin-1').firestore();
+              const member = env.authenticatedContext('member-1').firestore();
+              const stranger = env.authenticatedContext('stranger-1').firestore();
+              const guest = env.unauthenticatedContext().firestore();
+              await env.withSecurityRulesDisabled(async context => {
+                const db = context.firestore();
+                await setDoc(doc(db, p), {name:'TKOR', ownerUid:'leader-1', joinCodeHash:hash, createdAt:'2026-10-09'});
+                for (const [uid,role] of [['leader-1','leader'],['admin-1','admin'],['member-1','member']]) {
+                  await setDoc(doc(db, `${p}/members/${uid}`), {uid, role, nickname:uid, joinCodeHash:hash, joinedAt:'2026-10-09'});
+                }
+                await setDoc(doc(db, `${p}/notices/n1`), {id:'n1',content:'공지',pinned:false,createdAt:'2026-10-09',updatedAt:'2026-10-09'});
+                await setDoc(doc(db, `${p}/suggestions/s1`), {content:'건의',senderUid:'member-1',createdAt:'2026-10-09',status:'pending'});
+              });
+              await assertSucceeds(getDoc(doc(member, `${p}/notices/n1`)));
+              await assertFails(getDoc(doc(stranger, `${p}/notices/n1`)));
+              await assertFails(getDoc(doc(guest, `${p}/notices/n1`)));
+              const nextNotice = {id:'n2',content:'관리자 공지',pinned:false,createdAt:'2026-10-09',updatedAt:'2026-10-09'};
+              await assertSucceeds(setDoc(doc(admin, `${p}/notices/n2`), nextNotice));
+              await assertFails(setDoc(doc(member, `${p}/notices/n3`), {...nextNotice,id:'n3'}));
+              await assertFails(updateDoc(doc(member, `${p}/members/member-1`), {role:'leader'}));
+              await assertFails(updateDoc(doc(admin, `${p}/members/member-1`), {role:'admin'}));
+              await assertSucceeds(updateDoc(doc(owner, `${p}/members/member-1`), {role:'admin'}));
+              await assertSucceeds(updateDoc(doc(owner, `${p}/members/member-1`), {role:'member'}));
+              await assertFails(getDocs(collection(member, `${p}/suggestions`)));
+              await assertSucceeds(getDocs(collection(admin, `${p}/suggestions`)));
+              await assertSucceeds(getDoc(doc(member, `${p}/suggestions/s1`)));
+              await assertFails(getDoc(doc(stranger, `${p}/suggestions/s1`)));
+              await assertSucceeds(setDoc(doc(member, `${p}/suggestions/s2`), {content:'새 건의',senderUid:'member-1',createdAt:'2026-10-09',status:'pending'}));
+              await assertSucceeds(setDoc(doc(admin, `${p}/suggestionRestrictions/member-1`), {blocked:true,reason:'도배',actorUid:'admin-1',updatedAt:'2026-10-09'}));
+              await assertFails(setDoc(doc(member, `${p}/suggestions/s3`), {content:'차단 후 건의',senderUid:'member-1',createdAt:'2026-10-09',status:'pending'}));
+              await assertFails(setDoc(doc(admin, `${p}/suggestionRestrictions/leader-1`), {blocked:true,reason:'x',actorUid:'admin-1',updatedAt:'2026-10-09'}));
+              await assertSucceeds(setDoc(doc(member, 'bugReports/bug1'), {content:'버그',senderUid:'member-1',createdAt:'2026-10-09',status:'pending',screen:'설정'}));
+              await assertFails(getDoc(doc(stranger, 'bugReports/bug1')));
+              await assertSucceeds(getDoc(doc(member, 'bugReports/bug1')));
+              await assertFails(setDoc(doc(guest, 'bugReports/bug2'), {content:'버그',senderUid:'guest',createdAt:'2026-10-09',status:'pending',screen:'설정'}));
+              // Verify the atomic guild bootstrap supported by LastPlanBridge.java.
+              const creator = env.authenticatedContext('new-leader').firestore();
+              const newHash = 'c'.repeat(64);
+              const batch = writeBatch(creator);
+              batch.set(doc(creator,'guilds/guildB'), {name:'새 길드',ownerUid:'new-leader',joinCodeHash:newHash,createdAt:'2026-10-09'});
+              batch.set(doc(creator,`guildDirectory/${newHash}`), {guildId:'guildB',ownerUid:'new-leader',createdAt:'2026-10-09'});
+              batch.set(doc(creator,'guilds/guildB/members/new-leader'), {uid:'new-leader',nickname:'길드장',role:'leader',joinCodeHash:newHash,joinedAt:'2026-10-09'});
+              await assertSucceeds(batch.commit());
+              await assertFails(setDoc(doc(stranger,`${p}/members/stranger-1`), {uid:'stranger-1',nickname:'침입',role:'leader',joinCodeHash:hash,joinedAt:'2026-10-09'}));
+              console.log('PASS: Firestore emulator permissions: member/admin/leader/guest, suggestions, restrictions, bug reports, atomic guild creation.');
+            } finally { await env.cleanup(); }
+          })().catch(err => { console.error(err); process.exitCode = 1; });
+          LASTPLAN_BASE_TEST
           npx firebase emulators:exec --config firebase-rename-deploy.json --only firestore --project demo-last-plan-rename \
-            'node tests/guild-rename-rules.test.cjs'
+            'node tests/guild-rename-rules.test.cjs && node tests/firestore-base-permissions.test.cjs'
+
+      - name: Restore signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$KEYSTORE_BASE64" || (echo "Missing ANDROID_KEYSTORE_BASE64 secret" && exit 1)
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/LAST_PLAN_release.jks"
+
+      - name: Build release APK
+        working-directory: build-src/LAST_PLAN_Android
+        run: gradle :app:assembleRelease --no-daemon
+
+      - name: Sign APK with fixed key
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          test -n "$KEYSTORE_PASSWORD" || (echo "Missing ANDROID_KEYSTORE_PASSWORD secret" && exit 1)
+          mkdir -p dist
+          UNSIGNED="build-src/LAST_PLAN_Android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          ALIGNED="$RUNNER_TEMP/LAST-PLAN-aligned.apk"
+          ZIPALIGN="$ANDROID_SDK_ROOT/build-tools/35.0.0/zipalign"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner"
+
+          "$ZIPALIGN" -f -p 4 "$UNSIGNED" "$ALIGNED"
+
+          "$APKSIGNER" sign \
+            --ks "$RUNNER_TEMP/LAST_PLAN_release.jks" \
+            --ks-key-alias lastplan \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --key-pass "pass:$KEYSTORE_PASSWORD" \
+            --out dist/LAST-PLAN.apk \
+            "$ALIGNED"
+
+          "$APKSIGNER" verify --verbose --print-certs dist/LAST-PLAN.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LAST-PLAN-APK
+          path: dist/LAST-PLAN.apk
+          if-no-files-found: error
 
       - name: Deploy renamed guild rules to Firebase
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_guild_rename_rules == true }}
